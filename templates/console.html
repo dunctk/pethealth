@@ -12,7 +12,6 @@
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Pet Health home"><span class="brand-mark">P+</span><span>PET HEALTH</span></a>
-    <div class="command-status"><span class="live-dot"></span>Ready to record</div>
     <details class="account-menu">
       <summary aria-label="Account menu"><span class="avatar">{{ user.initials }}</span><span>{{ user.display_name }}</span><span aria-hidden="true">⌄</span></summary>
       <div class="account-popover floating-material">
@@ -54,7 +53,7 @@
       <section class="metrics" aria-label="Health summary">
         <div><small>EVENTS</small><strong>{{ events.len() }}</strong><span>in this history</span></div>
         <div><small>LATEST EVENT</small><strong>{% match events.first() %}{% when Some with (event) %}{{ event.summary }}{% when None %}No event yet{% endmatch %}</strong><span>{% match events.first() %}{% when Some with (event) %}{{ event.occurred_label }}{% when None %}Add your first event{% endmatch %}</span></div>
-        <div><small>VET LINKS</small><strong>{{ shares.len() }}</strong><span>created for this household</span></div>
+        <div><small>VET LINKS</small><strong>{{ shares.len() }}</strong><span>shared with your vet</span></div>
       </section>
       {% include "_agent_timeline.html" %}
       {% when None %}
@@ -63,7 +62,7 @@
     </main>
 
     <aside class="context-panel">
-      <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div><span class="graph-status"><i></i> ready</span></section>
+      <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div></section>
       {% match knowledge %}
       {% when Some with (article) %}
       <article class="knowledge-card">

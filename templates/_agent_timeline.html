@@ -17,7 +17,7 @@
       {% for event in events %}
         <article class="event-row">
           <div class="event-rail"><span class="event-icon {{ event.tone }}">{{ event.icon }}</span><i></i></div>
-          <div class="event-body"><div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at }}">{{ event.occurred_label }}</time><span>via {{ event.source }}</span></div>
+          <div class="event-body"><div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at }}">{{ event.occurred_label }}</time></div>
             <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>{% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
           </div>
           <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>

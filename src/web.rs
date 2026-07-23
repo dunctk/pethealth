@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/register", get(register_page).post(register))
         .route("/share/{token}", get(shared_pet))
+        .route("/mcp", post(crate::mcp::endpoint))
         .merge(protected)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)

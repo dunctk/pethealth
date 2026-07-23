@@ -8,6 +8,21 @@ The first complete workflow is intentionally direct:
 
 The application also creates expiring, revocable, read-only vet links. Share tokens are stored only as SHA-256 hashes and are displayed to the owner once.
 
+## MCP for Codex and Claude
+
+Pet Health exposes an authenticated MCP endpoint at `/mcp`. It uses the same expiring, revocable account sessions as the web app: send the session token as `Authorization: Bearer <session-token>` or use the browser session cookie. Every tool call is scoped to that account's household.
+
+The available tools cover listing pets, reading a pet timeline, reading care context, adding a pet, recording an observation, and undoing an event. Write tools are explicit, preserve the user's original wording, and let the server choose timestamps.
+
+For Claude Code, add the endpoint with a bearer token from an active Pet Health session:
+
+```bash
+claude mcp add --transport http pethealth https://your-host/mcp \\
+  --header "Authorization: Bearer $PETHEALTH_SESSION_TOKEN"
+```
+
+For Codex, add the same URL and bearer token as a remote MCP server in the MCP settings for your Codex client. Keep write actions enabled only for users who should be able to change the household record. OAuth discovery and a consent screen are the next auth layer; the current bearer token is already revocable from Account settings because it is an ordinary app session.
+
 ## Run locally
 
 ```bash

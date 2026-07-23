@@ -41,6 +41,17 @@ APP_USERNAME=owner APP_PASSWORD='replace-me' docker compose -f compose.productio
 
 In Coolify, route the `pethealth` service to `https://your-host:3000`. Keep the bootstrap `APP_PASSWORD` in Coolify's protected environment settings rather than adding it to the compose file. Back up the named volume containing `/persistent/pethealth.sqlite` together with its WAL files.
 
+## GitHub Actions image publishing
+
+The `main` branch workflow runs the Rust checks and publishes `dunctk/pethealth:mvp` to Docker Hub. Add these repository secrets in GitHub before pushing changes to `main`:
+
+```text
+DOCKERHUB_USERNAME=dunctk
+DOCKERHUB_TOKEN=<Docker Hub access token>
+```
+
+Create the token in Docker Hub under **Account settings → Personal access tokens**. Give it permission to push to the `pethealth` repository. Use the token as `DOCKERHUB_TOKEN`, not your Docker Hub password.
+
 ## Optional Rig agent
 
 Common health phrases are handled locally so capture remains available without a provider. Configure the following to let Rig structure observations outside the deterministic vocabulary:

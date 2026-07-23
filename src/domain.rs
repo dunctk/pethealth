@@ -72,6 +72,39 @@ pub struct ShareGrant {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct WeightEntry {
+    pub id: i64,
+    pub pet_id: i64,
+    pub weight_kg: f64,
+    pub measured_at: DateTime<Utc>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LabReport {
+    pub id: i64,
+    pub pet_id: i64,
+    pub pet_name: String,
+    pub source_filename: String,
+    pub raw_text: String,
+    pub test_date: Option<String>,
+    pub imported_at: DateTime<Utc>,
+    pub parse_status: String,
+    pub results: Vec<LabResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LabResult {
+    pub id: i64,
+    pub test_name: String,
+    pub value_text: String,
+    pub value_numeric: Option<f64>,
+    pub unit: Option<String>,
+    pub reference_range: Option<String>,
+    pub flag: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProposedEvent {
     pub pet_name: String,

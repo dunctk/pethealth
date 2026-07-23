@@ -9,6 +9,8 @@ services:
       APP_PORT: "3000"
       APP_USERNAME: ${APP_USERNAME:?}
       APP_PASSWORD: ${APP_PASSWORD:?}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      BLOOD_TESTS_DIR: ${BLOOD_TESTS_DIR:-/persistent/blood_tests}
       RUST_LOG: pethealth=info,tower_http=info
     expose:
       - "3000"

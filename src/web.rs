@@ -1,6 +1,7 @@
 use crate::{
     AppState, auth, db,
-    domain::{HealthEvent, KnowledgeArticle, Pet, ShareGrant, UserAccount},
+    domain::{HealthEvent, KnowledgeArticle, LabReport, Pet, ShareGrant, UserAccount, WeightEntry},
+    ocr,
 };
 use askama::Template;
 use axum::{
@@ -20,6 +21,8 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/", get(index))
         .route("/pets", post(create_pet))
+        .route("/weights", post(create_weight))
+        .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
         .route("/events/{id}/undo", post(undo_event))
         .route("/shares", post(create_share))
@@ -223,6 +226,14 @@ async fn index(
         0
     };
     let shares = db::list_shares(&state.db, user.household_id).await?;
+    let weights = match &selected_pet {
+        Some(pet) => db::list_weights(&state.db, user.household_id, pet.id).await?,
+        None => Vec::new(),
+    };
+    let lab_reports = match &selected_pet {
+        Some(pet) => db::list_lab_reports(&state.db, user.household_id, pet.id).await?,
+        None => Vec::new(),
+    };
     render(&ConsoleTemplate {
         user,
         pets,
@@ -231,6 +242,8 @@ async fn index(
         knowledge,
         related_count,
         shares,
+        weights,
+        lab_reports,
         new_share_path: None,
         capture_message: None,
         capture_error: None,
@@ -272,6 +285,70 @@ async fn create_pet(
     )
     .await?;
     Ok(Redirect::to(&format!("/?pet={id}")))
+}
+
+#[derive(Deserialize)]
+struct WeightForm {
+    pet_id: i64,
+    weight_kg: f64,
+    measured_at: String,
+    note: Option<String>,
+}
+
+async fn create_weight(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<WeightForm>,
+) -> Result<Redirect, AppError> {
+    if db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::not_found());
+    }
+    if !(0.01..=500.0).contains(&form.weight_kg) {
+        return Err(AppError::validation(
+            "Weight must be between 0.01 and 500 kg.",
+        ));
+    }
+    let date = clean_required(&form.measured_at, 30, "Date")?;
+    let measured_at = if date.len() == 10 {
+        format!("{date}T12:00:00Z")
+    } else {
+        date.to_owned()
+    };
+    db::create_weight(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        form.pet_id,
+        form.weight_kg,
+        &measured_at,
+        clean_optional(form.note.as_deref(), 240),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/?pet={}", form.pet_id)))
+}
+
+async fn import_blood_tests(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+) -> Result<Redirect, AppError> {
+    let pets = db::list_pets(&state.db, user.household_id).await?;
+    let imported = ocr::import_directory(
+        &state.config,
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pets,
+    )
+    .await?;
+    let imported_count = imported
+        .iter()
+        .filter(|item| item.report_id.is_some())
+        .count();
+    tracing::info!(user = user.id, imported_count, "blood-test import finished");
+    Ok(Redirect::to("/"))
 }
 
 #[derive(Deserialize)]
@@ -623,6 +700,8 @@ struct ConsoleTemplate {
     knowledge: Option<KnowledgeArticle>,
     related_count: u64,
     shares: Vec<ShareGrant>,
+    weights: Vec<WeightEntry>,
+    lab_reports: Vec<LabReport>,
     new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,

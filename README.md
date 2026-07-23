@@ -8,6 +8,12 @@ The first complete workflow is intentionally direct:
 
 The application also creates expiring, revocable, read-only vet links. Share tokens are stored only as SHA-256 hashes and are displayed to the owner once.
 
+## Weights and blood tests
+
+The console keeps a dated weight history for each pet. Blood-test files are read from `BLOOD_TESTS_DIR` (local default: `./example_blood_tests`; production compose default: `/persistent/blood_tests`). Syncthing can place PDF, PNG, JPG, JPEG, or AVIF files there. The owner then chooses **Import new tests**, or calls the MCP `import_blood_tests` tool.
+
+Imports use Mistral OCR 4 (`mistral-ocr-4-0`) with block and table extraction. The OCR text is stored alongside parsed test name, value, unit, reference range, flag, and test date. Spanish and English labels are accepted, and the original OCR text remains available for review when a row cannot be parsed. Set `MISTRAL_API_KEY` in the environment or local `.env`; never commit that file.
+
 ## MCP for Codex and Claude
 
 Pet Health exposes an authenticated MCP endpoint at `/mcp`. It uses the same expiring, revocable account sessions as the web app: send the session token as `Authorization: Bearer <session-token>` or use the browser session cookie. Every tool call is scoped to that account's household.

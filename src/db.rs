@@ -156,6 +156,47 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_shares_tenant_pet
             ON share_grants(household_id, pet_id, expires_at DESC);
+        CREATE TABLE IF NOT EXISTS weight_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            weight_kg REAL NOT NULL,
+            measured_at TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_weights_tenant_pet_time
+            ON weight_entries(household_id, pet_id, measured_at DESC);
+        CREATE TABLE IF NOT EXISTS lab_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            source_filename TEXT NOT NULL,
+            document_hash TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            test_date TEXT,
+            imported_at TEXT NOT NULL,
+            parse_status TEXT NOT NULL DEFAULT 'needs_review',
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id),
+            UNIQUE (household_id, document_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lab_reports_tenant_pet
+            ON lab_reports(household_id, pet_id, test_date DESC);
+        CREATE TABLE IF NOT EXISTS lab_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL,
+            test_name TEXT NOT NULL,
+            value_text TEXT NOT NULL,
+            value_numeric REAL,
+            unit TEXT,
+            reference_range TEXT,
+            flag TEXT,
+            FOREIGN KEY (report_id) REFERENCES lab_reports(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_lab_results_report ON lab_results(report_id, test_name);
         "#,
     ))
     .await?;
@@ -421,6 +462,170 @@ pub async fn find_pet_by_name(
         "SELECT id,name,species,breed,date_of_birth,weight_kg FROM pets WHERE household_id=? AND name=? COLLATE NOCASE",
         [household_id.into(), name.into()],
     )).await?.map(pet_from_row).transpose()
+}
+
+pub async fn create_weight(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet_id: i64,
+    weight_kg: f64,
+    measured_at: &str,
+    note: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO weight_entries(household_id,pet_id,weight_kg,measured_at,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+        [household_id.into(), pet_id.into(), weight_kg.into(), measured_at.into(), note.into(), now.clone().into()],
+    )).await?.ok_or_else(|| anyhow!("weight insert returned no id"))?;
+    let id: i64 = row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "weight.created",
+        "weight_entry",
+        id,
+        &format!("{weight_kg:.2} kg"),
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(id)
+}
+
+pub async fn list_weights(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+) -> anyhow::Result<Vec<crate::domain::WeightEntry>> {
+    let rows = db.query_all(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT id,pet_id,weight_kg,measured_at,note FROM weight_entries WHERE household_id=? AND pet_id=? ORDER BY measured_at DESC LIMIT 100",
+        [household_id.into(), pet_id.into()],
+    )).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::domain::WeightEntry {
+                id: row.try_get("", "id")?,
+                pet_id: row.try_get("", "pet_id")?,
+                weight_kg: row.try_get("", "weight_kg")?,
+                measured_at: row
+                    .try_get::<String>("", "measured_at")?
+                    .parse()
+                    .context("invalid weight timestamp")?,
+                note: row.try_get("", "note")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn report_hash_exists(
+    db: &DatabaseConnection,
+    household_id: i64,
+    document_hash: &str,
+) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id FROM lab_reports WHERE household_id=? AND document_hash=?",
+            [household_id.into(), document_hash.into()],
+        ))
+        .await?
+        .is_some())
+}
+
+pub async fn create_lab_report(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet_id: i64,
+    source_filename: &str,
+    document_hash: &str,
+    raw_text: &str,
+    test_date: Option<&str>,
+    results: &[crate::ocr::ParsedLabResult],
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO lab_reports(household_id,pet_id,source_filename,document_hash,raw_text,test_date,imported_at,parse_status) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+        [household_id.into(), pet_id.into(), source_filename.into(), document_hash.into(), raw_text.into(), test_date.into(), now.clone().into(), (if results.is_empty() { "needs_review" } else { "parsed" }).into()],
+    )).await?.ok_or_else(|| anyhow!("lab report insert returned no id"))?;
+    let report_id: i64 = row.try_get("", "id")?;
+    for result in results {
+        transaction.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO lab_results(report_id,test_name,value_text,value_numeric,unit,reference_range,flag) VALUES(?,?,?,?,?,?,?)",
+            [report_id.into(), result.test_name.clone().into(), result.value_text.clone().into(), result.value_numeric.into(), result.unit.clone().into(), result.reference_range.clone().into(), result.flag.clone().into()],
+        )).await?;
+    }
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "lab_report.imported",
+        "lab_report",
+        report_id,
+        source_filename,
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(report_id)
+}
+
+pub async fn list_lab_reports(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+) -> anyhow::Result<Vec<crate::domain::LabReport>> {
+    let reports = db.query_all(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT r.id,r.pet_id,p.name,r.source_filename,r.raw_text,r.test_date,r.imported_at,r.parse_status FROM lab_reports r JOIN pets p ON p.id=r.pet_id WHERE r.household_id=? AND r.pet_id=? ORDER BY COALESCE(r.test_date,r.imported_at) DESC LIMIT 50",
+        [household_id.into(), pet_id.into()],
+    )).await?;
+    let mut output = Vec::with_capacity(reports.len());
+    for row in reports {
+        let report_id: i64 = row.try_get("", "id")?;
+        let result_rows = db.query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id,test_name,value_text,value_numeric,unit,reference_range,flag FROM lab_results WHERE report_id=? ORDER BY id",
+            [report_id.into()],
+        )).await?;
+        let results = result_rows
+            .into_iter()
+            .map(|result| {
+                Ok(crate::domain::LabResult {
+                    id: result.try_get("", "id")?,
+                    test_name: result.try_get("", "test_name")?,
+                    value_text: result.try_get("", "value_text")?,
+                    value_numeric: result.try_get("", "value_numeric")?,
+                    unit: result.try_get("", "unit")?,
+                    reference_range: result.try_get("", "reference_range")?,
+                    flag: result.try_get("", "flag")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        output.push(crate::domain::LabReport {
+            id: report_id,
+            pet_id: row.try_get("", "pet_id")?,
+            pet_name: row.try_get("", "name")?,
+            source_filename: row.try_get("", "source_filename")?,
+            raw_text: row.try_get("", "raw_text")?,
+            test_date: row.try_get("", "test_date")?,
+            imported_at: row
+                .try_get::<String>("", "imported_at")?
+                .parse()
+                .context("invalid lab timestamp")?,
+            parse_status: row.try_get("", "parse_status")?,
+            results,
+        });
+    }
+    Ok(output)
 }
 
 pub async fn create_pet(

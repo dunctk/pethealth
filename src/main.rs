@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod domain;
 mod mcp;
+mod ocr;
 mod web;
 
 use anyhow::Context;

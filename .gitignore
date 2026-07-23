@@ -4,4 +4,4 @@
 /*.sqlite-shm
 /*.sqlite-wal
 /data
-
+/example_blood_tests/

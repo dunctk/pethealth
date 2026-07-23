@@ -12,10 +12,13 @@ pub struct Config {
     pub llm_api_key: Option<String>,
     pub llm_base_url: String,
     pub llm_model: String,
+    pub mistral_api_key: Option<String>,
+    pub blood_tests_dir: String,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let _ = dotenvy::dotenv();
         let production = env_bool("PRODUCTION");
         let database_url = if production {
             let parent = Path::new("/persistent");
@@ -47,6 +50,9 @@ impl Config {
             llm_base_url: env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned()),
             llm_model: env::var("LLM_MODEL").unwrap_or_else(|_| "openai/gpt-4.1-mini".to_owned()),
+            mistral_api_key: nonempty_env("MISTRAL_API_KEY"),
+            blood_tests_dir: env::var("BLOOD_TESTS_DIR")
+                .unwrap_or_else(|_| "./example_blood_tests".to_owned()),
         })
     }
 }
@@ -78,6 +84,8 @@ mod tests {
             llm_api_key: None,
             llm_base_url: String::new(),
             llm_model: String::new(),
+            mistral_api_key: None,
+            blood_tests_dir: "./example_blood_tests".into(),
         };
         assert!(config.database_url.contains("/persistent/pethealth.sqlite"));
     }

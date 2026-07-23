@@ -134,7 +134,11 @@ fn tool_list() -> Value {
         {"name":"list_pets","description":"List the pets in the signed-in household.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}},
         {"name":"get_pet_timeline","description":"Read active health events for one pet. The original wording is included.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_health_context","description":"Read practical care context for a health concept. This is not a diagnosis.","inputSchema":{"type":"object","properties":{"concept":{"type":"string"}},"required":["concept"]},"annotations":{"readOnlyHint":true}},
+        {"name":"get_weight_history","description":"Read weight measurements over time for one pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
+        {"name":"get_blood_test_history","description":"Read imported blood-test values for one pet. Original reports remain stored for review.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"add_pet","description":"Add a pet to the signed-in household.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"species":{"type":"string"},"breed":{"type":"string"},"weight_kg":{"type":"number"}},"required":["name","species"]}},
+        {"name":"record_weight","description":"Save a weight measurement for a pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"weight_kg":{"type":"number"},"measured_at":{"type":"string","description":"YYYY-MM-DD"},"note":{"type":"string"}},"required":["pet_id","weight_kg","measured_at"]}},
+        {"name":"import_blood_tests","description":"OCR new PDF and image files from the configured blood-test folder using Mistral OCR 4.","inputSchema":{"type":"object","properties":{} }},
         {"name":"record_health_event","description":"Record one observation from the user's wording. The server chooses the timestamp and preserves the original wording.","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
         {"name":"undo_health_event","description":"Undo an active health event in the signed-in household.","inputSchema":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}}
     ]})
@@ -190,6 +194,38 @@ async fn call_tool(
             )
             .map_err(internal)?
         }
+        "get_weight_history" => {
+            let pet_id = integer(&args, "pet_id")?;
+            if db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err((-32602, "That pet is not in this household.".into()));
+            }
+            serde_json::to_value(
+                db::list_weights(&state.db, user.household_id, pet_id)
+                    .await
+                    .map_err(internal)?,
+            )
+            .map_err(internal)?
+        }
+        "get_blood_test_history" => {
+            let pet_id = integer(&args, "pet_id")?;
+            if db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err((-32602, "That pet is not in this household.".into()));
+            }
+            serde_json::to_value(
+                db::list_lab_reports(&state.db, user.household_id, pet_id)
+                    .await
+                    .map_err(internal)?,
+            )
+            .map_err(internal)?
+        }
         "add_pet" => {
             let name = string(&args, "name")?;
             let species = string(&args, "species")?;
@@ -205,6 +241,56 @@ async fn call_tool(
             .await
             .map_err(internal)?;
             json!({"pet_id":id,"message":"Pet added."})
+        }
+        "record_weight" => {
+            let pet_id = integer(&args, "pet_id")?;
+            if db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err((-32602, "That pet is not in this household.".into()));
+            }
+            let weight = args
+                .get("weight_kg")
+                .and_then(Value::as_f64)
+                .ok_or((-32602, "weight_kg is required.".into()))?;
+            if !(0.01..=500.0).contains(&weight) {
+                return Err((-32602, "weight_kg must be between 0.01 and 500.".into()));
+            }
+            let date = string(&args, "measured_at")?;
+            let measured_at = if date.len() == 10 {
+                format!("{date}T12:00:00Z")
+            } else {
+                date
+            };
+            let id = db::create_weight(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                pet_id,
+                weight,
+                &measured_at,
+                args.get("note").and_then(Value::as_str),
+            )
+            .await
+            .map_err(internal)?;
+            json!({"weight_id":id,"message":"Weight saved."})
+        }
+        "import_blood_tests" => {
+            let pets = db::list_pets(&state.db, user.household_id)
+                .await
+                .map_err(internal)?;
+            let imported = crate::ocr::import_directory(
+                &state.config,
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pets,
+            )
+            .await
+            .map_err(internal)?;
+            serde_json::to_value(imported.iter().map(|item| json!({"filename":item.filename,"report_id":item.report_id,"message":item.message})).collect::<Vec<_>>()).map_err(internal)?
         }
         "record_health_event" => {
             let message = string(&args, "message")?;

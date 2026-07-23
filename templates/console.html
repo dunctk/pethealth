@@ -52,7 +52,7 @@
       </section>
       <section class="metrics" aria-label="Health summary">
         <div><small>EVENTS</small><strong>{{ events.len() }}</strong><span>in this history</span></div>
-        <div><small>LATEST EVENT</small><strong>{% match events.first() %}{% when Some with (event) %}{{ event.summary }}{% when None %}No event yet{% endmatch %}</strong><span>{% match events.first() %}{% when Some with (event) %}{{ event.occurred_label }}{% when None %}Add your first event{% endmatch %}</span></div>
+        <div><small>LATEST WEIGHT</small><strong>{% match weights.first() %}{% when Some with (weight) %}{{ weight.weight_kg }} kg{% when None %}Not recorded{% endmatch %}</strong><span>{% match weights.first() %}{% when Some with (weight) %}{{ weight.measured_at }}{% when None %}Track it over time{% endmatch %}</span></div>
         <div><small>VET LINKS</small><strong>{{ shares.len() }}</strong><span>shared with your vet</span></div>
       </section>
       {% include "_agent_timeline.html" %}
@@ -84,6 +84,32 @@
           <button class="button secondary" type="submit">Create vet link</button>
         </form>
         {% include "_shares.html" %}
+      </section>
+      {% when None %}{% endmatch %}
+      {% match selected_pet %}{% when Some with (pet) %}
+      <section class="tracker-box">
+        <div class="side-label">WEIGHT OVER TIME</div>
+        <h2>Track {{ pet.name }}'s weight</h2>
+        <p>Add a measurement whenever you weigh your pet. The list stays in date order.</p>
+        <form method="post" action="/weights" class="tracker-form">
+          <input type="hidden" name="pet_id" value="{{ pet.id }}">
+          <label>Weight, kg<input required type="number" min="0.01" max="500" step="0.01" name="weight_kg" placeholder="12.4"></label>
+          <label>Date<input required type="date" name="measured_at"></label>
+          <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="240" name="note" placeholder="After dinner"></label>
+          <button class="button secondary full-width" type="submit">Save weight</button>
+        </form>
+        {% if weights.is_empty() %}<p class="tracker-empty">No weight measurements yet.</p>{% else %}
+        <div class="weight-list">{% for weight in weights %}<div class="weight-row"><strong>{{ weight.weight_kg }} kg</strong><span>{{ weight.measured_at }}{% match weight.note %}{% when Some with (note) %}<small>{{ note }}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>
+        {% endif %}
+      </section>
+      <section class="tracker-box lab-box">
+        <div class="side-label">BLOOD TESTS</div>
+        <h2>Bring in a lab report</h2>
+        <p>Drop a PDF or image into <code>example_blood_tests</code>, then import it. Spanish and English reports are supported.</p>
+        <form method="post" action="/blood-tests/import"><button class="button secondary" type="submit">Import new tests</button></form>
+        {% if lab_reports.is_empty() %}<p class="tracker-empty">No blood tests imported yet.</p>{% else %}
+        <div class="lab-list">{% for report in lab_reports %}<article class="lab-report"><div class="lab-report-head"><strong>{{ report.test_date.as_deref().unwrap_or("Date not found") }}</strong><small>{{ report.source_filename }}</small></div>{% if report.results.is_empty() %}<p>Text saved, but no result rows were recognized yet.</p>{% else %}<div class="lab-results">{% for result in report.results %}<div><span>{{ result.test_name }}</span><strong>{{ result.value_text }}{% match result.unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</strong>{% match result.flag %}{% when Some with (flag) %}<b>{{ flag }}</b>{% when None %}{% endmatch %}</div>{% endfor %}</div>{% endif %}<details class="ocr-details"><summary>Show extracted text</summary><pre>{{ report.raw_text }}</pre></details></article>{% endfor %}</div>
+        {% endif %}
       </section>
       {% when None %}{% endmatch %}
     </aside>

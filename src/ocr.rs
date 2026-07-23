@@ -176,6 +176,21 @@ fn match_pet(filename: &str, pets: &[Pet]) -> Option<Pet> {
     pets.iter()
         .find(|pet| lower.contains(&pet.name.to_lowercase()))
         .cloned()
+        .or_else(|| (pets.len() == 1).then(|| pets[0].clone()))
+}
+
+fn is_metadata_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "id" | "sexo"
+            | "sex"
+            | "edad"
+            | "age"
+            | "fecha"
+            | "date"
+            | "fecha de registro"
+            | "registration date"
+    )
 }
 
 fn find_date(text: &str) -> Option<String> {
@@ -214,6 +229,7 @@ pub fn parse_results(text: &str) -> Vec<ParsedLabResult> {
         if name.len() < 2
             || name.eq_ignore_ascii_case("test")
             || name.eq_ignore_ascii_case("prueba")
+            || is_metadata_name(name)
         {
             continue;
         }
@@ -264,7 +280,7 @@ mod tests {
     #[test]
     fn parses_english_and_spanish_table_rows() {
         let results = parse_results(
-            "| Prueba | Resultado | Unidad |\n| Hemoglobina | 14,2 | g/dL |\n| ALT | 55 | U/L | H |",
+            "| Prueba | Resultado | Unidad |\n| ID | 19072 | |\n| Hemoglobina | 14,2 | g/dL |\n| ALT | 55 | U/L | H |",
         );
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].test_name, "Hemoglobina");

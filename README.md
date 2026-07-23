@@ -10,7 +10,7 @@ The application also creates expiring, revocable, read-only vet links. Share tok
 
 ## Weights and blood tests
 
-The console keeps a dated weight history for each pet. Blood-test files are read from `BLOOD_TESTS_DIR` (local default: `./example_blood_tests`; production compose default: `/persistent/blood_tests`). Syncthing can place PDF, PNG, JPG, JPEG, or AVIF files there. The owner then chooses **Import new tests**, or calls the MCP `import_blood_tests` tool.
+The console keeps a dated weight history for each pet. Blood-test files are stored under a private household directory beneath `BLOOD_TESTS_DIR` (local default: `./example_blood_tests`; production compose default: `/persistent/blood_tests`). The web console can upload a PDF or image directly, and Syncthing can place files in the matching household directory. The owner then chooses **Import new tests**, or calls the MCP `upload_blood_test` / `import_blood_tests` tools.
 
 Imports use Mistral OCR 4 (`mistral-ocr-4-0`) with block and table extraction. The OCR text is stored alongside parsed test name, value, unit, reference range, flag, and test date. Spanish and English labels are accepted, and the original OCR text remains available for review when a row cannot be parsed. Set `MISTRAL_API_KEY` in the environment or local `.env`; never commit that file.
 

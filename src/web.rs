@@ -6,7 +6,7 @@ use crate::{
 use askama::Template;
 use axum::{
     Extension, Form, Router,
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -22,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
+        .route("/blood-tests/upload", post(upload_blood_test))
         .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
         .route("/events/{id}/undo", post(undo_event))
@@ -30,6 +31,7 @@ pub fn router(state: AppState) -> Router {
         .route("/account", get(account_page))
         .route("/account/password", post(change_password))
         .route("/logout", post(logout))
+        .layer(DefaultBodyLimit::max(ocr::MAX_UPLOAD_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/healthz", get(healthz))
@@ -39,7 +41,11 @@ pub fn router(state: AppState) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/register", get(register_page).post(register))
         .route("/share/{token}", get(shared_pet))
-        .route("/mcp", post(crate::mcp::endpoint))
+        .route(
+            "/mcp",
+            post(crate::mcp::endpoint)
+                .layer(DefaultBodyLimit::max(ocr::MAX_UPLOAD_BYTES + 1024 * 1024)),
+        )
         .route(
             "/.well-known/oauth-protected-resource",
             get(crate::mcp::protected_resource_metadata),
@@ -395,6 +401,45 @@ async fn import_blood_tests(
         .filter(|item| item.report_id.is_some())
         .count();
     tracing::info!(user = user.id, imported_count, "blood-test import finished");
+    Ok(Redirect::to("/"))
+}
+
+async fn upload_blood_test(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    mut multipart: Multipart,
+) -> Result<Redirect, AppError> {
+    let mut uploaded = false;
+    while let Some(field) = multipart.next_field().await? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = field
+            .file_name()
+            .ok_or_else(|| AppError::validation("Choose a blood-test file."))?
+            .to_owned();
+        let bytes = field.bytes().await?;
+        ocr::store_upload(&state.config, user.household_id, &filename, &bytes).await?;
+        uploaded = true;
+        break;
+    }
+    if !uploaded {
+        return Err(AppError::validation("Choose a blood-test file."));
+    }
+    let pets = db::list_pets(&state.db, user.household_id).await?;
+    let imported = ocr::import_directory(
+        &state.config,
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pets,
+    )
+    .await?;
+    let imported_count = imported
+        .iter()
+        .filter(|item| item.report_id.is_some())
+        .count();
+    tracing::info!(user = user.id, imported_count, "blood-test upload finished");
     Ok(Redirect::to("/"))
 }
 

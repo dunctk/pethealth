@@ -107,7 +107,11 @@
       <section class="tracker-box lab-box">
         <div class="side-label">BLOOD TESTS</div>
         <h2>Bring in a lab report</h2>
-        <p>Drop a PDF or image into <code>example_blood_tests</code>, then import it. Spanish and English reports are supported.</p>
+        <p>Upload a PDF or image here. Each household gets its own private storage area. Spanish and English reports are supported.</p>
+        <form method="post" action="/blood-tests/upload" enctype="multipart/form-data" class="tracker-form">
+          <label class="full-width">Lab report<input required type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.avif,application/pdf,image/*"></label>
+          <button class="button secondary full-width" type="submit">Upload and import</button>
+        </form>
         <form method="post" action="/blood-tests/import"><button class="button secondary" type="submit">Import new tests</button></form>
         {% if lab_reports.is_empty() %}<p class="tracker-empty">No blood tests imported yet.</p>{% else %}
         <div class="lab-list">{% for report in lab_reports %}<article class="lab-report"><div class="lab-report-head"><strong>{{ report.test_date.as_deref().unwrap_or("Date not found") }}</strong><small>{{ report.source_filename }}</small></div>{% if report.results.is_empty() %}<p>Text saved, but no result rows were recognized yet.</p>{% else %}<div class="lab-results">{% for result in report.results %}<div><span>{{ result.test_name }}</span><strong>{{ result.value_text }}{% match result.unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</strong>{% match result.flag %}{% when Some with (flag) %}<b>{{ flag }}</b>{% when None %}{% endmatch %}</div>{% endfor %}</div>{% endif %}<details class="ocr-details"><summary>Show extracted text</summary><pre>{{ report.raw_text }}</pre></details></article>{% endfor %}</div>

@@ -4,7 +4,9 @@ use base64::Engine;
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ParsedLabResult {
@@ -39,6 +41,50 @@ pub struct ImportResult {
     pub message: String,
 }
 
+pub fn household_directory(config: &Config, household_id: i64) -> anyhow::Result<PathBuf> {
+    if household_id < 1 {
+        return Err(anyhow!("household id must be positive"));
+    }
+    Ok(Path::new(&config.blood_tests_dir).join(household_id.to_string()))
+}
+
+pub async fn store_upload(
+    config: &Config,
+    household_id: i64,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<String> {
+    if bytes.is_empty() {
+        return Err(anyhow!("the uploaded file is empty"));
+    }
+    if bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(anyhow!("the uploaded file is too large"));
+    }
+    let safe_name = safe_filename(filename)?;
+    let directory = household_directory(config, household_id)?;
+    tokio::fs::create_dir_all(&directory).await?;
+    let mut destination = directory.join(&safe_name);
+    if tokio::fs::try_exists(&destination).await? {
+        let hash = hex_hash(bytes);
+        let stem = destination
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("blood-test");
+        let extension = destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default();
+        destination = directory.join(format!("{stem}-{}{extension}", &hash[..12]));
+    }
+    tokio::fs::write(&destination, bytes).await?;
+    Ok(destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&safe_name)
+        .to_owned())
+}
+
 pub async fn import_directory(
     config: &Config,
     db: &sea_orm::DatabaseConnection,
@@ -46,7 +92,7 @@ pub async fn import_directory(
     actor: &str,
     pets: &[Pet],
 ) -> anyhow::Result<Vec<ImportResult>> {
-    let path = Path::new(&config.blood_tests_dir);
+    let path = household_directory(config, household_id)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -150,6 +196,30 @@ fn is_supported(path: &Path) -> bool {
             .as_deref(),
         Some("pdf" | "png" | "jpg" | "jpeg" | "avif")
     )
+}
+
+fn safe_filename(filename: &str) -> anyhow::Result<String> {
+    let basename = Path::new(filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("a filename is required"))?;
+    let cleaned = basename
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_owned();
+    if cleaned.is_empty() || !is_supported(Path::new(&cleaned)) {
+        return Err(anyhow!("only PDF and image blood-test files are supported"));
+    }
+    Ok(cleaned)
 }
 fn mime_for(path: &Path) -> Option<&'static str> {
     match path
@@ -320,6 +390,22 @@ fn parse_number(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(root: &Path) -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            port: 3000,
+            username: "owner".into(),
+            password: "password".into(),
+            production: false,
+            database_url: "sqlite::memory:".into(),
+            llm_api_key: None,
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            mistral_api_key: None,
+            blood_tests_dir: root.to_string_lossy().into_owned(),
+        }
+    }
     #[test]
     fn parses_english_and_spanish_table_rows() {
         let results = parse_results(
@@ -337,5 +423,30 @@ mod tests {
         assert_eq!(results[0].value_text, "44.72");
         assert_eq!(results[0].value_numeric, Some(44.72));
         assert_eq!(results[0].unit.as_deref(), Some("nmol/L"));
+    }
+
+    #[tokio::test]
+    async fn uploaded_files_are_separated_by_household() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        store_upload(&config, 1, "../sample.pdf", b"first")
+            .await
+            .unwrap();
+        store_upload(&config, 2, "sample.pdf", b"second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(root.path().join("1/sample.pdf"))
+                .await
+                .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            tokio::fs::read(root.path().join("2/sample.pdf"))
+                .await
+                .unwrap(),
+            b"second"
+        );
     }
 }

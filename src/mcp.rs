@@ -691,7 +691,8 @@ fn tool_list() -> Value {
         {"name":"get_blood_test_history","description":"Read imported blood-test values for one pet. Original reports remain stored for review.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"add_pet","description":"Add a pet to the signed-in household.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"species":{"type":"string"},"breed":{"type":"string"},"weight_kg":{"type":"number"}},"required":["name","species"]}},
         {"name":"record_weight","description":"Save a weight measurement for a pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"weight_kg":{"type":"number"},"measured_at":{"type":"string","description":"YYYY-MM-DD"},"note":{"type":"string"}},"required":["pet_id","weight_kg","measured_at"]}},
-        {"name":"import_blood_tests","description":"OCR new PDF and image files from the configured blood-test folder using Mistral OCR 4.","inputSchema":{"type":"object","properties":{} }},
+        {"name":"upload_blood_test","description":"Store one PDF or image in this household's private area and import it with Mistral OCR 4.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"},"content_base64":{"type":"string","description":"The PDF or image bytes encoded as base64."}},"required":["filename","content_base64"]}},
+        {"name":"import_blood_tests","description":"OCR new PDF and image files from this household's private blood-test folder using Mistral OCR 4.","inputSchema":{"type":"object","properties":{} }},
         {"name":"record_health_event","description":"Record one observation from the user's wording. The server chooses the timestamp and preserves the original wording.","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
         {"name":"undo_health_event","description":"Undo an active health event in the signed-in household.","inputSchema":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}}
     ]})
@@ -829,6 +830,29 @@ async fn call_tool(
             .await
             .map_err(internal)?;
             json!({"weight_id":id,"message":"Weight saved."})
+        }
+        "upload_blood_test" => {
+            let filename = string(&args, "filename")?;
+            let content = string(&args, "content_base64")?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(content)
+                .map_err(|_| (-32602, "content_base64 is invalid.".into()))?;
+            crate::ocr::store_upload(&state.config, user.household_id, &filename, &bytes)
+                .await
+                .map_err(internal)?;
+            let pets = db::list_pets(&state.db, user.household_id)
+                .await
+                .map_err(internal)?;
+            let imported = crate::ocr::import_directory(
+                &state.config,
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pets,
+            )
+            .await
+            .map_err(internal)?;
+            serde_json::to_value(imported.iter().map(|item| json!({"filename":item.filename,"report_id":item.report_id,"message":item.message})).collect::<Vec<_>>()).map_err(internal)?
         }
         "import_blood_tests" => {
             let pets = db::list_pets(&state.db, user.household_id)

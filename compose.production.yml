@@ -1,6 +1,6 @@
 services:
   pethealth:
-    image: dunctk/pethealth:mvp
+    image: ghcr.io/dunctk/pethealth:mvp
     pull_policy: always
     restart: unless-stopped
     environment:

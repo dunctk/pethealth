@@ -32,7 +32,7 @@ When `PRODUCTION=true`, the database location is not configurable: it resolves t
 
 The process refuses to start if `/persistent` is absent or the production password is unchanged. Mount durable local storage at `/persistent`; SQLite runs in WAL mode with foreign keys, a busy timeout, and `synchronous=FULL`.
 
-The checked-in `compose.production.yml` is the Coolify production definition. It deliberately has no host port mapping, pulls the public `dunctk/pethealth:mvp` image, and declares the durable volume explicitly:
+The checked-in `compose.production.yml` is the Coolify production definition. It deliberately has no host port mapping, pulls the public `ghcr.io/dunctk/pethealth:mvp` image, and declares the durable volume explicitly:
 
 ```bash
 docker build -t pethealth:mvp .
@@ -43,14 +43,9 @@ In Coolify, route the `pethealth` service to `https://your-host:3000`. Keep the 
 
 ## GitHub Actions image publishing
 
-The `main` branch workflow runs the Rust checks and publishes `dunctk/pethealth:mvp` to Docker Hub. Add these repository secrets in GitHub before pushing changes to `main`:
+The `main` branch workflow runs the Rust checks and publishes `ghcr.io/dunctk/pethealth:mvp` to GitHub Container Registry using the built-in `GITHUB_TOKEN`. No repository secrets are needed.
 
-```text
-DOCKERHUB_USERNAME=dunctk
-DOCKERHUB_TOKEN=<Docker Hub access token>
-```
-
-Create the token in Docker Hub under **Account settings → Personal access tokens**. Give it permission to push to the `pethealth` repository. Use the token as `DOCKERHUB_TOKEN`, not your Docker Hub password.
+After the first successful publish, open the package settings on GitHub and set the `pethealth` container package visibility to **Public**. Coolify pulls the image without credentials.
 
 ## Optional Rig agent
 

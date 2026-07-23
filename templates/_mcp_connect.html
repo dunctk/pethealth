@@ -1,7 +1,12 @@
 <section class="mcp-connect" aria-labelledby="mcp-connect-title">
   <div class="mcp-connect-top"><span class="side-label">CONNECT AN AI ASSISTANT</span><span class="mcp-ready">READY</span></div>
   <h2 id="mcp-connect-title">Connect Claude, Codex, or another agent</h2>
-  <p>Copy this URL. Paste it into Claude Cowork, Claude Code, Codex, or another client's <strong>Add MCP server</strong> box. It will ask you to sign in.</p>
+  <p>Copy this prompt into your AI assistant. If it asks for an MCP server, use the URL below.</p>
+  <div class="mcp-prompt-row">
+    <textarea id="mcp-prompt" readonly rows="4" aria-label="Pet Health connection prompt">Connect to my Pet Health account using this MCP server: {{ mcp_url }}. Ask me to sign in if needed. Once connected, confirm that you can read my pet's health history. Do not diagnose or change records unless I ask.</textarea>
+    <button class="button primary" type="button" data-copy-target="#mcp-prompt">Copy prompt</button>
+  </div>
+  <p class="mcp-url-label">If your client has an <strong>Add MCP server</strong> box, paste this URL there:</p>
   <div class="mcp-url-row">
     <input id="mcp-url" readonly value="{{ mcp_url }}" aria-label="Pet Health MCP server URL">
     <button class="button secondary" type="button" data-copy-target="#mcp-url">Copy URL</button>

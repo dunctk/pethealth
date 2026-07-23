@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Account settings · Pet Health</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="auth-page">
+  <header class="auth-topbar"><a class="brand" href="/"><span class="brand-mark">P+</span><span>PET HEALTH</span></a><a class="back-console" href="/">← Back to your pets</a></header>
+  <main class="settings-shell">
+    <header class="settings-head"><div class="eyebrow">YOUR ACCOUNT</div><h1>Account settings</h1><p>Change the password you use to sign in.</p></header>
+    <section class="settings-grid">
+      <div class="identity-panel">
+        <span class="avatar large">{{ user.initials }}</span><div><h2>{{ user.display_name }}</h2><p>{% match user.email %}{% when Some with (email) %}{{ email }}{% when None %}@{{ user.username }}{% endmatch %}</p></div>
+        <dl><div><dt>Account</dt><dd>Household owner</dd></div><div><dt>Records</dt><dd>Your household only</dd></div></dl>
+      </div>
+      <section class="auth-panel settings-panel" aria-labelledby="password-title">
+        <h2 id="password-title">Change password</h2><p>Changing your password signs out all devices, including this one.</p>
+        {% match error %}{% when Some with (message) %}<div class="auth-error" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
+        <form method="post" action="/account/password" class="auth-form">
+          <label>Current password<input required minlength="12" maxlength="128" type="password" name="current_password" autocomplete="current-password"></label>
+          <label>New password<span class="field-hint">12 characters minimum</span><input required minlength="12" maxlength="128" type="password" name="new_password" autocomplete="new-password"></label>
+          <button class="button primary" type="submit">Change password and sign out</button>
+        </form>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

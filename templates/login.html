@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Pet Health · Keep your pet's health history in one place</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="auth-page">
+  <header class="auth-topbar"><a class="brand" href="/login"><span class="brand-mark">P+</span><span>PET HEALTH</span></a><span>YOUR PET'S HEALTH HISTORY</span></header>
+  <main class="auth-shell">
+    <section class="auth-context" aria-label="Product overview">
+      <div class="eyebrow">PET CARE / ONE TIMELINE</div>
+      <h1>Keep your pet's history<br>ready for the next visit.</h1>
+      <p>Write down what happened in your own words. Keep each pet's history together, then share it with your vet when you need to.</p>
+      <ul><li><span>01</span>One clear history for each pet</li><li><span>02</span>Vet links that expire</li><li><span>03</span>Your household keeps control</li></ul>
+    </section>
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <h2 id="auth-title">Welcome back</h2><p>Sign in to view your pets and their health history.</p>
+      {% match notice %}{% when Some with (message) %}<div class="auth-notice" role="status">{{ message }}</div>{% when None %}{% endmatch %}
+      {% match error %}{% when Some with (message) %}<div class="auth-error" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
+      <form method="post" action="/login" class="auth-form">
+        <label>Email or username<input required autofocus maxlength="254" name="identifier" value="{{ identifier }}" autocomplete="username" inputmode="email"></label>
+        <label>Password<input required minlength="12" maxlength="128" type="password" name="password" autocomplete="current-password"></label>
+        <button class="button primary" type="submit">Sign in</button>
+      </form>
+      <p class="auth-switch">New to Pet Health? <a href="/register">Create an account</a></p>
+    </section>
+  </main>
+</body>
+</html>

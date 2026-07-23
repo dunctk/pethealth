@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Create your Pet Health account</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="auth-page">
+  <header class="auth-topbar"><a class="brand" href="/login"><span class="brand-mark">P+</span><span>PET HEALTH</span></a><span>NEW HOUSEHOLD</span></header>
+  <main class="auth-shell">
+    <section class="auth-context" aria-label="Account privacy">
+      <div class="eyebrow">YOUR HOUSEHOLD / YOUR DATA</div>
+      <h1>Start a health history<br>for every pet.</h1>
+      <p>Your account keeps your pets and their records in a separate household. No one else can see them unless you share a link.</p>
+      <ul><li><span>01</span>Each household has its own records</li><li><span>02</span>You can revoke vet access</li><li><span>03</span>Nothing is shared by default</li></ul>
+    </section>
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <h2 id="auth-title">Create your account</h2><p>You'll be signed in and can add your first pet.</p>
+      {% match error %}{% when Some with (message) %}<div class="auth-error" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
+      <form method="post" action="/register" class="auth-form">
+        <label>Your name<input required autofocus maxlength="80" name="display_name" value="{{ display_name }}" autocomplete="name"></label>
+        <label>Email<input required maxlength="254" type="email" name="email" value="{{ email }}" autocomplete="email"></label>
+        <label>Password<span class="field-hint">12 characters minimum</span><input required minlength="12" maxlength="128" type="password" name="password" autocomplete="new-password"></label>
+      <button class="button primary" type="submit">Create account</button>
+      </form>
+      <p class="auth-switch">Already have an account? <a href="/login">Sign in</a></p>
+    </section>
+  </main>
+</body>
+</html>

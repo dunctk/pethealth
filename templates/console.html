@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+  <title>Pet Health</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V" crossorigin="anonymous"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Pet Health home"><span class="brand-mark">P+</span><span>PET HEALTH</span></a>
+    <div class="command-status"><span class="live-dot"></span>Ready to record</div>
+    <details class="account-menu">
+      <summary aria-label="Account menu"><span class="avatar">{{ user.initials }}</span><span>{{ user.display_name }}</span><span aria-hidden="true">⌄</span></summary>
+      <div class="account-popover floating-material">
+        <div><strong>{{ user.display_name }}</strong><small>{% match user.email %}{% when Some with (email) %}{{ email }}{% when None %}@{{ user.username }}{% endmatch %}</small></div>
+        <a href="/account">Account settings</a>
+        <form method="post" action="/logout"><button type="submit">Sign out</button></form>
+      </div>
+    </details>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="side-label">YOUR PETS</div>
+      <nav class="pet-list" aria-label="Your pets">
+        {% for pet in pets %}
+        <a href="/?pet={{ pet.id }}" class="pet-link {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}active{% endif %}{% when None %}{% endmatch %}" {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}aria-current="page"{% endif %}{% when None %}{% endmatch %}>
+          <span class="pet-avatar">{{ pet.initials }}</span><span><b>{{ pet.name }}</b><small>{{ pet.species }}</small></span>
+        </a>
+        {% endfor %}
+      </nav>
+      <details class="add-pet" {% if pets.is_empty() %}open{% endif %}>
+        <summary>+ Add pet</summary>
+        <form method="post" action="/pets" class="stack-form">
+          <label>Name<input required maxlength="80" name="name" autocomplete="off"></label>
+          <label>Species<select name="species"><option>Cat</option><option>Dog</option><option>Rabbit</option><option>Bird</option><option>Other</option></select></label>
+          <label>Breed<input maxlength="80" name="breed"></label>
+          <label>Weight, kg<input type="number" min="0.01" max="500" step="0.01" name="weight_kg"></label>
+          <button class="button primary" type="submit">Create pet</button>
+        </form>
+      </details>
+      <div class="side-footer"><span>AGPL-3.0</span><span>SELF-HOSTABLE</span></div>
+    </aside>
+
+    <main class="workspace">
+      {% match selected_pet %}
+      {% when Some with (pet) %}
+      <section class="pet-header">
+        <div><div class="eyebrow">HEALTH HISTORY / {{ pet.species|upper }}</div><h1>{{ pet.name }}</h1><p>{% match pet.breed %}{% when Some with (breed) %}{{ breed }} · {% when None %}{% endmatch %}{% match pet.weight_kg %}{% when Some with (weight) %}{{ weight }} kg{% when None %}Weight not recorded{% endmatch %}</p></div>
+      </section>
+      <section class="metrics" aria-label="Health summary">
+        <div><small>EVENTS</small><strong>{{ events.len() }}</strong><span>in this history</span></div>
+        <div><small>LATEST EVENT</small><strong>{% match events.first() %}{% when Some with (event) %}{{ event.summary }}{% when None %}No event yet{% endmatch %}</strong><span>{% match events.first() %}{% when Some with (event) %}{{ event.occurred_label }}{% when None %}Add your first event{% endmatch %}</span></div>
+        <div><small>VET LINKS</small><strong>{{ shares.len() }}</strong><span>created for this household</span></div>
+      </section>
+      {% include "_agent_timeline.html" %}
+      {% when None %}
+      <section class="zero-state"><span class="zero-glyph">P+</span><h1>Add your first pet</h1><p>Add a pet to start a health history. You can record what happens and share it with your vet later.</p></section>
+      {% endmatch %}
+    </main>
+
+    <aside class="context-panel">
+      <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div><span class="graph-status"><i></i> ready</span></section>
+      {% match knowledge %}
+      {% when Some with (article) %}
+      <article class="knowledge-card">
+        <div class="concept-line"><span>ABOUT THIS EVENT</span><code>{{ article.concept }}</code></div>
+        <h2>{{ article.title }}</h2><p>{{ article.summary }}</p>
+        <h3>What to watch</h3><p>{{ article.monitoring }}</p>
+        <div class="urgent"><b>Seek prompt advice</b><p>{{ article.urgent_signs }}</p></div>
+        {% match article.source_url %}{% when Some with (url) %}<a href="{{ url }}" target="_blank" rel="noopener">Read the source ↗</a>{% when None %}{% endmatch %}
+      </article>
+      <div class="linked-events"><strong>{{ related_count }}</strong><span>related event{% if related_count != 1 %}s{% endif %}<small>for this pet</small></span></div>
+      {% when None %}
+      <div class="context-empty"><span>⌁</span><p>After you record an event, you'll see related history and care information here.</p></div>
+      {% endmatch %}
+      {% match selected_pet %}{% when Some with (pet) %}
+      <section class="share-box"><div class="side-label">SHARE WITH YOUR VET</div><h2>Share {{ pet.name }}'s history</h2><p>Create a link your vet can view. It expires automatically.</p>
+        <form hx-post="/shares" hx-target="#shares-region" hx-swap="outerHTML" class="share-form">
+          <input type="hidden" name="pet_id" value="{{ pet.id }}"><label>Vet or clinic<input required maxlength="120" name="label" placeholder="Dr. Ruiz"></label>
+          <label>Expires<select name="days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label>
+          <button class="button secondary" type="submit">Create vet link</button>
+        </form>
+        {% include "_shares.html" %}
+      </section>
+      {% when None %}{% endmatch %}
+    </aside>
+  </div>
+</body>
+</html>

@@ -1,0 +1,25 @@
+services:
+  pethealth:
+    image: dunctk/pethealth:mvp
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      PRODUCTION: "true"
+      APP_HOST: 0.0.0.0
+      APP_PORT: "3000"
+      APP_USERNAME: ${APP_USERNAME:?}
+      APP_PASSWORD: ${APP_PASSWORD:?}
+      RUST_LOG: pethealth=info,tower_http=info
+    expose:
+      - "3000"
+    volumes:
+      - pethealth-data:/persistent
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  pethealth-data:

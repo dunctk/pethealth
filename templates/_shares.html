@@ -1,0 +1,6 @@
+<section id="shares-region" class="shares-region" aria-live="polite">
+  {% match new_share_path %}{% when Some with (path) %}<div class="new-share"><b>Vet link ready</b><div><input readonly value="{{ path }}" aria-label="New vet link"><button type="button" onclick="navigator.clipboard.writeText(location.origin + this.previousElementSibling.value); this.textContent='Copied'">Copy</button></div><small>Copy this link now. You won't see it again.</small></div>{% when None %}{% endmatch %}
+  {% for share in shares %}
+  <div class="share-row"><span><b>{{ share.label }}</b><small>{{ share.pet_name }} · {{ share.status }}</small></span>{% if share.status == "active" %}<form hx-post="/shares/{{ share.id }}/revoke" hx-target="#shares-region" hx-swap="outerHTML"><button class="quiet-action danger" type="submit">Stop access</button></form>{% endif %}</div>
+  {% endfor %}
+</section>

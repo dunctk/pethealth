@@ -1,0 +1,29 @@
+<section id="agent-and-timeline" class="agent-and-timeline">
+  <form class="agent-capture" hx-post="/agent/capture" hx-target="#agent-and-timeline" hx-swap="outerHTML" hx-indicator="#agent-thinking">
+    {% match selected_pet %}{% when Some with (pet) %}<input type="hidden" name="selected_pet_id" value="{{ pet.id }}">{% when None %}{% endmatch %}
+    <div class="agent-label"><span class="agent-orb">✦</span><span><b>Record an event</b><small>Write what happened in your own words</small></span><span id="agent-thinking" class="htmx-indicator">SAVING...</span></div>
+    <div class="capture-row"><label class="sr-only" for="message">Pet health observation</label><input id="message" name="message" required maxlength="1000" autocomplete="off" placeholder="Milo vomited just now"><button class="send-button" type="submit" aria-label="Record observation">↑</button></div>
+    <div class="capture-help"><span>Your words are saved with the event.</span><span>Try: “{{ selected_pet.as_ref().unwrap().name }} vomited twice 10 minutes ago”</span></div>
+    {% match capture_message %}{% when Some with (message) %}<div class="capture-result success" role="status"><span>✓</span>{{ message }}</div>{% when None %}{% endmatch %}
+    {% match capture_error %}{% when Some with (message) %}<div class="capture-result error" role="alert"><span>!</span>{{ message }}</div>{% when None %}{% endmatch %}
+  </form>
+
+  <section id="timeline-region" class="timeline-region" aria-live="polite">
+    <div class="section-head"><div><span class="eyebrow">HEALTH HISTORY</span><h2>Timeline</h2></div><span>{{ events.len() }} event{% if events.len() != 1 %}s{% endif %}</span></div>
+    {% if events.is_empty() %}
+      <div class="timeline-empty"><span>＋</span><h3>No events yet</h3><p>Use the box above to record what happened. We'll keep your original words with the date and time.</p></div>
+    {% else %}
+      <div class="timeline">
+      {% for event in events %}
+        <article class="event-row">
+          <div class="event-rail"><span class="event-icon {{ event.tone }}">{{ event.icon }}</span><i></i></div>
+          <div class="event-body"><div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at }}">{{ event.occurred_label }}</time><span>via {{ event.source }}</span></div>
+            <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>{% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
+          </div>
+          <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
+        </article>
+      {% endfor %}
+      </div>
+    {% endif %}
+  </section>
+</section>

@@ -39,6 +39,30 @@ pub fn router(state: AppState) -> Router {
         .route("/register", get(register_page).post(register))
         .route("/share/{token}", get(shared_pet))
         .route("/mcp", post(crate::mcp::endpoint))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::mcp::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::mcp::authorization_server_metadata),
+        )
+        .route("/oauth/register", post(crate::mcp::register_client))
+        .route(
+            "/oauth/device",
+            get(crate::mcp::device_page).post(crate::mcp::start_device_authorization),
+        )
+        .route("/oauth/device/verify", post(crate::mcp::verify_device_code))
+        .route(
+            "/oauth/device/approve",
+            post(crate::mcp::approve_device_code),
+        )
+        .route("/oauth/authorize", get(crate::mcp::authorize))
+        .route(
+            "/oauth/authorize/approve",
+            post(crate::mcp::approve_authorize),
+        )
+        .route("/oauth/token", post(crate::mcp::token))
         .merge(protected)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -47,6 +71,7 @@ pub fn router(state: AppState) -> Router {
 #[derive(Deserialize, Default)]
 struct LoginPageQuery {
     changed: Option<bool>,
+    next: Option<String>,
 }
 
 async fn login_page(Query(query): Query<LoginPageQuery>) -> Result<Html<String>, AppError> {
@@ -57,6 +82,7 @@ async fn login_page(Query(query): Query<LoginPageQuery>) -> Result<Html<String>,
             .changed
             .unwrap_or(false)
             .then(|| "Password updated. Sign in again on this device.".into()),
+        next: query.next,
     })
 }
 
@@ -72,6 +98,7 @@ async fn register_page() -> Result<Html<String>, AppError> {
 struct LoginForm {
     identifier: String,
     password: String,
+    next: Option<String>,
 }
 
 async fn login(
@@ -94,12 +121,17 @@ async fn login(
                 identifier,
                 error: Some("Email/username or password is incorrect.".into()),
                 notice: None,
+                next: form.next,
             },
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     };
     let token = db::create_session(&state.db, user.id).await?;
-    Ok(session_redirect("/", session_cookie(&state, &token, false)))
+    let destination = safe_login_next(form.next.as_deref()).unwrap_or("/");
+    Ok(session_redirect(
+        destination,
+        session_cookie(&state, &token, false),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -641,10 +673,18 @@ fn session_cookie(state: &AppState, token: &str, clear: bool) -> HeaderValue {
     .expect("session cookie contains only safe characters")
 }
 
-fn session_redirect(location: &'static str, cookie: HeaderValue) -> Response {
+fn session_redirect(location: &str, cookie: HeaderValue) -> Response {
     let mut response = Redirect::to(location).into_response();
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
+}
+
+fn safe_login_next(next: Option<&str>) -> Option<&str> {
+    next.filter(|value| {
+        (value.starts_with("/oauth/authorize?") || value.starts_with("/oauth/device?"))
+            && !value.contains('\n')
+            && !value.contains('\r')
+    })
 }
 
 fn same_origin(method: &Method, headers: &HeaderMap) -> bool {
@@ -713,6 +753,7 @@ struct LoginTemplate {
     identifier: String,
     error: Option<String>,
     notice: Option<String>,
+    next: Option<String>,
 }
 
 #[derive(Template)]

@@ -21,6 +21,7 @@
       {% match notice %}{% when Some with (message) %}<div class="auth-notice" role="status">{{ message }}</div>{% when None %}{% endmatch %}
       {% match error %}{% when Some with (message) %}<div class="auth-error" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
       <form method="post" action="/login" class="auth-form">
+        {% match next %}{% when Some with (value) %}<input type="hidden" name="next" value="{{ value }}">{% when None %}{% endmatch %}
         <label>Email or username<input required autofocus maxlength="254" name="identifier" value="{{ identifier }}" autocomplete="username" inputmode="email"></label>
         <label>Password<input required minlength="12" maxlength="128" type="password" name="password" autocomplete="current-password"></label>
         <button class="button primary" type="submit">Sign in</button>

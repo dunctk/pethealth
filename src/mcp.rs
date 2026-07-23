@@ -4,13 +4,16 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::State,
-    http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
+    extract::{Form, Query, State},
+    http::{HeaderMap, StatusCode, Uri, header},
+    response::{Html, IntoResponse, Redirect, Response},
 };
+use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
@@ -75,6 +78,13 @@ async fn authenticate(
     let Some(token) = token else {
         return Err((StatusCode::UNAUTHORIZED, "Sign in is required."));
     };
+    if let Some(user) = db::resolve_oauth_access_token(&state.db, token)
+        .await
+        .ok()
+        .flatten()
+    {
+        return Ok(user);
+    }
     db::resolve_session(&state.db, token)
         .await
         .ok()
@@ -83,6 +93,544 @@ async fn authenticate(
             StatusCode::UNAUTHORIZED,
             "The session is missing, expired, or revoked.",
         ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub client_name: Option<String>,
+    pub redirect_uris: Vec<String>,
+}
+
+pub async fn register_client(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterRequest>,
+) -> Result<Json<Value>, Response> {
+    if request.redirect_uris.is_empty() || request.redirect_uris.len() > 10 {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "redirect_uris is required.",
+        ));
+    }
+    if request.redirect_uris.iter().any(|uri| {
+        uri.is_empty()
+            || uri.contains('#')
+            || uri
+                .parse::<Uri>()
+                .ok()
+                .is_none_or(|parsed| parsed.scheme().is_none() || parsed.authority().is_none())
+    }) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "Each redirect URI must be absolute and must not contain a fragment.",
+        ));
+    }
+    let client_id = format!("pethealth_{}", crate::auth::new_session_token());
+    let client_name = request.client_name.unwrap_or_else(|| "MCP client".into());
+    db::create_oauth_client(&state.db, &client_id, &client_name, &request.redirect_uris)
+        .await
+        .map_err(internal_response)?;
+    Ok(Json(json!({
+        "client_id":client_id,
+        "client_name":client_name,
+        "redirect_uris":request.redirect_uris,
+        "grant_types":["authorization_code","refresh_token"],
+        "response_types":["code"],
+        "token_endpoint_auth_method":"none"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceAuthorizationForm {
+    pub client_id: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub scope: Option<String>,
+}
+
+pub async fn start_device_authorization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeviceAuthorizationForm>,
+) -> Result<Json<Value>, Response> {
+    validate_device_client(&state, &form).await?;
+    let device_code = crate::auth::new_session_token();
+    let user_code = new_user_code();
+    db::create_oauth_device_code(
+        &state.db,
+        &crate::auth::token_hash(&device_code),
+        &crate::auth::token_hash(&normalize_user_code(&user_code)),
+        &form.client_id,
+        &form.code_challenge,
+    )
+    .await
+    .map_err(internal_response)?;
+    let origin = public_origin(&state, &headers);
+    Ok(Json(json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": format!("{origin}/oauth/device"),
+        "verification_uri_complete": format!("{origin}/oauth/device?user_code={}", urlencoding::encode(&user_code)),
+        "expires_in": 600,
+        "interval": 5,
+        "scope": form.scope.unwrap_or_else(|| "pethealth".into())
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DevicePageQuery {
+    pub user_code: Option<String>,
+}
+
+pub async fn device_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DevicePageQuery>,
+) -> Result<Response, Response> {
+    let Some(raw_code) = query.user_code.as_deref() else {
+        return Ok(Html(device_code_entry_html(None)).into_response());
+    };
+    let user_code = normalize_user_code(raw_code);
+    if user_code.len() != 10
+        || !db::oauth_device_user_code_exists(&state.db, &crate::auth::token_hash(&user_code))
+            .await
+            .map_err(internal_response)?
+    {
+        return Ok(Html(device_code_entry_html(Some(
+            "That code is invalid or expired.",
+        )))
+        .into_response());
+    }
+    if cookie_user(&state, &headers).await.is_none() {
+        let next = format!("/oauth/device?user_code={}", urlencoding::encode(raw_code));
+        return Ok(
+            Redirect::to(&format!("/login?next={}", urlencoding::encode(&next))).into_response(),
+        );
+    }
+    Ok(Html(device_consent_html(&user_code)).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceVerifyForm {
+    pub user_code: String,
+}
+
+pub async fn verify_device_code(Form(form): Form<DeviceVerifyForm>) -> Result<Redirect, Response> {
+    let user_code = normalize_user_code(&form.user_code);
+    if user_code.len() != 10 {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "Enter the code shown by the MCP client.",
+        ));
+    }
+    Ok(Redirect::to(&format!(
+        "/oauth/device?user_code={}",
+        urlencoding::encode(&form.user_code)
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceApproveForm {
+    pub user_code: String,
+}
+
+pub async fn approve_device_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeviceApproveForm>,
+) -> Result<Response, Response> {
+    let user = cookie_user(&state, &headers)
+        .await
+        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "Sign in is required."))?;
+    let user_code = normalize_user_code(&form.user_code);
+    let approved =
+        db::approve_oauth_device_code(&state.db, &crate::auth::token_hash(&user_code), user.id)
+            .await
+            .map_err(internal_response)?;
+    if !approved {
+        return Ok(Html(device_code_entry_html(Some(
+            "That code is invalid, expired, or already approved.",
+        )))
+        .into_response());
+    }
+    Ok(Html("<!doctype html><html lang=\"en\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Pet Health connected</title><link rel=\"stylesheet\" href=\"/static/app.css\"><body class=\"auth-page\"><main class=\"auth-shell\"><section class=\"auth-panel\"><div class=\"eyebrow\">PET HEALTH / MCP</div><h1>Connected.</h1><p>The MCP client can finish signing in now. You can close this window.</p></section></main></body></html>").into_response())
+}
+
+async fn validate_device_client(
+    state: &AppState,
+    form: &DeviceAuthorizationForm,
+) -> Result<(), Response> {
+    if form.code_challenge_method != "S256" || form.code_challenge.len() < 43 {
+        return Err(oauth_error(StatusCode::BAD_REQUEST, "Use S256 PKCE."));
+    }
+    if db::oauth_client_redirects(&state.db, &form.client_id)
+        .await
+        .map_err(internal_response)?
+        .is_none()
+    {
+        return Err(oauth_error(StatusCode::BAD_REQUEST, "Unknown client_id."));
+    }
+    Ok(())
+}
+
+fn new_user_code() -> String {
+    let raw = crate::auth::new_session_token().to_ascii_uppercase();
+    format!("{}-{}", &raw[..5], &raw[5..10])
+}
+
+fn normalize_user_code(code: &str) -> String {
+    code.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+fn device_code_entry_html(error: Option<&str>) -> String {
+    let message = error
+        .map(|value| {
+            format!(
+                "<div class=\"auth-error\" role=\"alert\">{}</div>",
+                escape(value)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Connect Pet Health</title><link rel=\"stylesheet\" href=\"/static/app.css\"></head><body class=\"auth-page\"><main class=\"auth-shell\"><section class=\"auth-panel\"><div class=\"eyebrow\">PET HEALTH / MCP</div><h1>Connect an MCP client</h1><p>Enter the one-time code shown in your terminal.</p>{message}<form method=\"post\" action=\"/oauth/device/verify\" class=\"auth-form\"><label>Connection code<input required autofocus name=\"user_code\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" placeholder=\"ABCDE-FGHIJ\"></label><button class=\"button primary\" type=\"submit\">Continue</button></form></section></main></body></html>"
+    )
+}
+
+fn device_consent_html(user_code: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Connect Pet Health</title><link rel=\"stylesheet\" href=\"/static/app.css\"></head><body class=\"auth-page\"><main class=\"auth-shell\"><section class=\"auth-panel\"><div class=\"eyebrow\">PET HEALTH / MCP</div><h1>Connect this client?</h1><p>The MCP client will be able to read and update the signed-in household through Pet Health.</p><form method=\"post\" action=\"/oauth/device/approve\" class=\"auth-form\"><input type=\"hidden\" name=\"user_code\" value=\"{}\"><button class=\"button primary\" type=\"submit\">Allow access</button></form><p class=\"auth-switch\"><a href=\"/\">Cancel</a></p></section></main></body></html>",
+        escape(user_code)
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeQuery {
+    pub response_type: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub state: Option<String>,
+}
+
+pub async fn authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthorizeQuery>,
+) -> Result<Response, Response> {
+    validate_authorize_request(&state, &query).await?;
+    let user = cookie_user(&state, &headers).await;
+    let Some(_) = user else {
+        let next = format!(
+            "/oauth/authorize?response_type={}&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256{}",
+            urlencoding::encode(&query.response_type),
+            urlencoding::encode(&query.client_id),
+            urlencoding::encode(&query.redirect_uri),
+            urlencoding::encode(&query.code_challenge),
+            query
+                .state
+                .as_deref()
+                .map(|state| format!("&state={}", urlencoding::encode(state)))
+                .unwrap_or_default()
+        );
+        return Ok(
+            Redirect::to(&format!("/login?next={}", urlencoding::encode(&next))).into_response(),
+        );
+    };
+    let state_field = query.state.clone().unwrap_or_default();
+    Ok(Html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Connect Pet Health</title><link rel=\"stylesheet\" href=\"/static/app.css\"></head><body class=\"auth-page\"><main class=\"auth-shell\"><section class=\"auth-panel\"><div class=\"eyebrow\">PET HEALTH / MCP</div><h1>Connect your pet history?</h1><p>This agent will be able to read and update the signed-in household through Pet Health.</p><form method=\"post\" action=\"/oauth/authorize/approve\" class=\"auth-form\"><input type=\"hidden\" name=\"client_id\" value=\"{}\"><input type=\"hidden\" name=\"redirect_uri\" value=\"{}\"><input type=\"hidden\" name=\"code_challenge\" value=\"{}\"><input type=\"hidden\" name=\"state\" value=\"{}\"><button class=\"button primary\" type=\"submit\">Allow access</button></form><p class=\"auth-switch\"><a href=\"/\">Cancel</a></p></section></main></body></html>",
+        escape(&query.client_id), escape(&query.redirect_uri), escape(&query.code_challenge), escape(&state_field)
+    )).into_response())
+}
+
+pub async fn approve_authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ApproveForm>,
+) -> Result<Response, Response> {
+    let query = AuthorizeQuery {
+        response_type: "code".into(),
+        client_id: form.client_id.clone(),
+        redirect_uri: form.redirect_uri.clone(),
+        code_challenge: form.code_challenge.clone(),
+        code_challenge_method: "S256".into(),
+        state: (!form.state.is_empty()).then_some(form.state.clone()),
+    };
+    validate_authorize_request(&state, &query).await?;
+    let user = cookie_user(&state, &headers)
+        .await
+        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "Sign in is required."))?;
+    let code = crate::auth::new_session_token();
+    db::create_oauth_code(
+        &state.db,
+        &crate::auth::token_hash(&code),
+        &form.client_id,
+        user.id,
+        &form.redirect_uri,
+        &form.code_challenge,
+    )
+    .await
+    .map_err(internal_response)?;
+    let mut location = format!(
+        "{}{}code={}",
+        form.redirect_uri,
+        if form.redirect_uri.contains('?') {
+            '&'
+        } else {
+            '?'
+        },
+        urlencoding::encode(&code)
+    );
+    if !form.state.is_empty() {
+        location.push_str(&format!("&state={}", urlencoding::encode(&form.state)));
+    }
+    Ok(Redirect::to(&location).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApproveForm {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenForm {
+    grant_type: String,
+    client_id: String,
+    code: Option<String>,
+    redirect_uri: Option<String>,
+    code_verifier: Option<String>,
+    refresh_token: Option<String>,
+    device_code: Option<String>,
+}
+
+pub async fn token(
+    State(state): State<AppState>,
+    Form(form): Form<TokenForm>,
+) -> Result<Json<Value>, Response> {
+    let tokens =
+        match form.grant_type.as_str() {
+            "authorization_code" => {
+                let code = form
+                    .code
+                    .as_deref()
+                    .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "code is required."))?;
+                let redirect_uri = form.redirect_uri.as_deref().ok_or_else(|| {
+                    oauth_error(StatusCode::BAD_REQUEST, "redirect_uri is required.")
+                })?;
+                let verifier = form.code_verifier.as_deref().ok_or_else(|| {
+                    oauth_error(StatusCode::BAD_REQUEST, "code_verifier is required.")
+                })?;
+                let Some((user_id, challenge)) = db::redeem_oauth_code(
+                    &state.db,
+                    &crate::auth::token_hash(code),
+                    &form.client_id,
+                    redirect_uri,
+                )
+                .await
+                .map_err(internal_response)?
+                else {
+                    return Err(oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "The authorization code is invalid or expired.",
+                    ));
+                };
+                let digest = Sha256::digest(verifier.as_bytes());
+                let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+                if computed.as_bytes().ct_eq(challenge.as_bytes()).unwrap_u8() != 1 {
+                    return Err(oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "PKCE verification failed.",
+                    ));
+                }
+                db::create_oauth_tokens(&state.db, &form.client_id, user_id)
+                    .await
+                    .map_err(internal_response)?
+            }
+            "refresh_token" => {
+                let refresh = form.refresh_token.as_deref().ok_or_else(|| {
+                    oauth_error(StatusCode::BAD_REQUEST, "refresh_token is required.")
+                })?;
+                db::refresh_oauth_tokens(&state.db, refresh, &form.client_id)
+                    .await
+                    .map_err(internal_response)?
+                    .ok_or_else(|| {
+                        oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "The refresh token is invalid or expired.",
+                        )
+                    })?
+            }
+            "urn:ietf:params:oauth:grant-type:device_code" => {
+                let device_code = form.device_code.as_deref().ok_or_else(|| {
+                    oauth_error(StatusCode::BAD_REQUEST, "device_code is required.")
+                })?;
+                let verifier = form.code_verifier.as_deref().ok_or_else(|| {
+                    oauth_error(StatusCode::BAD_REQUEST, "code_verifier is required.")
+                })?;
+                let Some((Some(user_id), challenge)) = db::oauth_device_code_state(
+                    &state.db,
+                    &crate::auth::token_hash(device_code),
+                    &form.client_id,
+                )
+                .await
+                .map_err(internal_response)?
+                else {
+                    if db::oauth_device_code_state(
+                        &state.db,
+                        &crate::auth::token_hash(device_code),
+                        &form.client_id,
+                    )
+                    .await
+                    .map_err(internal_response)?
+                    .is_some()
+                    {
+                        return Err(oauth_error_code(
+                            StatusCode::BAD_REQUEST,
+                            "authorization_pending",
+                            "Approve the connection in a browser first.",
+                        ));
+                    }
+                    return Err(oauth_error_code(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "The device code is invalid or expired.",
+                    ));
+                };
+                let digest = Sha256::digest(verifier.as_bytes());
+                let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+                if computed.as_bytes().ct_eq(challenge.as_bytes()).unwrap_u8() != 1 {
+                    return Err(oauth_error_code(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "PKCE verification failed.",
+                    ));
+                }
+                if !db::consume_oauth_device_code(
+                    &state.db,
+                    &crate::auth::token_hash(device_code),
+                    &form.client_id,
+                    user_id,
+                )
+                .await
+                .map_err(internal_response)?
+                {
+                    return Err(oauth_error_code(
+                        StatusCode::BAD_REQUEST,
+                        "authorization_pending",
+                        "Approve the connection in a browser first.",
+                    ));
+                }
+                db::create_oauth_tokens(&state.db, &form.client_id, user_id)
+                    .await
+                    .map_err(internal_response)?
+            }
+            _ => {
+                return Err(oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "Unsupported grant_type.",
+                ));
+            }
+        };
+    Ok(Json(
+        json!({"token_type":"Bearer","access_token":tokens.0,"refresh_token":tokens.1,"expires_in":tokens.2,"scope":"pethealth"}),
+    ))
+}
+
+pub async fn protected_resource_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let origin = public_origin(&state, &headers);
+    Json(
+        json!({"resource":format!("{origin}/mcp"),"authorization_servers":[origin],"scopes_supported":["pethealth"],"bearer_methods_supported":["header"]}),
+    )
+}
+
+pub async fn authorization_server_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let origin = public_origin(&state, &headers);
+    Json(
+        json!({"issuer":origin,"authorization_endpoint":format!("{origin}/oauth/authorize"),"device_authorization_endpoint":format!("{origin}/oauth/device"),"token_endpoint":format!("{origin}/oauth/token"),"registration_endpoint":format!("{origin}/oauth/register"),"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"scopes_supported":["pethealth"]}),
+    )
+}
+
+async fn validate_authorize_request(
+    state: &AppState,
+    query: &AuthorizeQuery,
+) -> Result<(), Response> {
+    if query.response_type != "code"
+        || query.code_challenge_method != "S256"
+        || query.code_challenge.len() < 43
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "Use response_type=code with S256 PKCE.",
+        ));
+    }
+    let Some(redirects) = db::oauth_client_redirects(&state.db, &query.client_id)
+        .await
+        .map_err(internal_response)?
+    else {
+        return Err(oauth_error(StatusCode::BAD_REQUEST, "Unknown client_id."));
+    };
+    if !redirects.iter().any(|uri| uri == &query.redirect_uri) {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "redirect_uri is not registered.",
+        ));
+    }
+    Ok(())
+}
+
+async fn cookie_user(state: &AppState, headers: &HeaderMap) -> Option<UserAccount> {
+    let token = cookie_token(state, headers)?;
+    db::resolve_session(&state.db, token).await.ok().flatten()
+}
+
+fn public_origin(state: &AppState, headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .unwrap_or(if state.config.production {
+            "https"
+        } else {
+            "http"
+        });
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:3000");
+    format!("{scheme}://{host}")
+}
+
+fn oauth_error(status: StatusCode, message: &str) -> Response {
+    oauth_error_code(status, "invalid_request", message)
+}
+fn oauth_error_code(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"error":code,"error_description":message})),
+    )
+        .into_response()
+}
+fn internal_response(error: impl std::fmt::Display) -> Response {
+    oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+}
+fn escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn cookie_token<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {

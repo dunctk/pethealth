@@ -31,6 +31,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1"
 # Keep these transitive versions aligned with the locally audited source cache.
 time = "=0.3.53"
 zerocopy = "=0.8.54"

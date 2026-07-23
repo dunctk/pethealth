@@ -16,18 +16,19 @@ Imports use Mistral OCR 4 (`mistral-ocr-4-0`) with block and table extraction. T
 
 ## MCP for Codex and Claude
 
-Pet Health exposes an authenticated MCP endpoint at `/mcp`. It uses the same expiring, revocable account sessions as the web app: send the session token as `Authorization: Bearer <session-token>` or use the browser session cookie. Every tool call is scoped to that account's household.
+Pet Health exposes an authenticated MCP endpoint at `/mcp`. MCP clients can use OAuth with S256 PKCE, discovered from the standard `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server` endpoints. Existing Pet Health session tokens also remain supported as revocable bearer tokens. Every tool call is scoped to that account's household.
 
 The available tools cover listing pets, reading a pet timeline, reading care context, adding a pet, recording an observation, and undoing an event. Write tools are explicit, preserve the user's original wording, and let the server choose timestamps.
 
-For Claude Code, add the endpoint with a bearer token from an active Pet Health session:
+For Claude Code, add the endpoint and let Claude complete the OAuth consent flow:
 
 ```bash
-claude mcp add --transport http pethealth https://your-host/mcp \\
-  --header "Authorization: Bearer $PETHEALTH_SESSION_TOKEN"
+claude mcp add --transport http pethealth https://your-host/mcp
 ```
 
-For Codex, add the same URL and bearer token as a remote MCP server in the MCP settings for your Codex client. Keep write actions enabled only for users who should be able to change the household record. OAuth discovery and a consent screen are the next auth layer; the current bearer token is already revocable from Account settings because it is an ordinary app session.
+For Codex, add the same URL as a remote MCP server. The client can discover the OAuth endpoints and ask the user to approve access. Keep write actions enabled only for users who should be able to change the household record.
+
+If the client is running over SSH without a display, use the device-code fallback: the client posts its PKCE challenge to `/oauth/device`, prints the returned `user_code`, and polls `/oauth/token` with the returned `device_code`. Open the returned `verification_uri` on any phone or computer, enter the code, sign in, and approve. The code expires after 10 minutes and can be used once.
 
 ## Run locally
 

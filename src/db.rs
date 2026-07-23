@@ -197,6 +197,56 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
             FOREIGN KEY (report_id) REFERENCES lab_reports(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_lab_results_report ON lab_results(report_id, test_name);
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_name TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS oauth_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_hash TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            FOREIGN KEY (client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_codes_active ON oauth_codes(code_hash, expires_at, used_at);
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            access_token_hash TEXT NOT NULL UNIQUE,
+            refresh_token_hash TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            access_expires_at TEXT NOT NULL,
+            refresh_expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            FOREIGN KEY (client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_access_active ON oauth_tokens(access_token_hash, access_expires_at, revoked_at);
+        CREATE INDEX IF NOT EXISTS idx_oauth_refresh_active ON oauth_tokens(refresh_token_hash, refresh_expires_at, revoked_at);
+        CREATE TABLE IF NOT EXISTS oauth_device_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_code_hash TEXT NOT NULL UNIQUE,
+            user_code_hash TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            user_id INTEGER,
+            approved_at TEXT,
+            consumed_at TEXT,
+            FOREIGN KEY (client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_device_active
+            ON oauth_device_codes(device_code_hash, client_id, expires_at, consumed_at);
+        CREATE INDEX IF NOT EXISTS idx_oauth_user_code_active
+            ON oauth_device_codes(user_code_hash, expires_at, consumed_at);
         "#,
     ))
     .await?;
@@ -386,6 +436,283 @@ pub async fn revoke_session(db: &DatabaseConnection, token: &str) -> anyhow::Res
     ))
     .await?;
     Ok(())
+}
+
+pub async fn create_oauth_client(
+    db: &DatabaseConnection,
+    client_id: &str,
+    client_name: &str,
+    redirect_uris: &[String],
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO oauth_clients(client_id,client_name,redirect_uris,created_at) VALUES(?,?,?,?)",
+        [
+            client_id.into(),
+            client_name.into(),
+            serde_json::to_string(redirect_uris)?.into(),
+            Utc::now().to_rfc3339().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn oauth_client_redirects(
+    db: &DatabaseConnection,
+    client_id: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(row) = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT redirect_uris FROM oauth_clients WHERE client_id=?",
+            [client_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(
+        &row.try_get::<String>("", "redirect_uris")?,
+    )?))
+}
+
+pub async fn create_oauth_code(
+    db: &DatabaseConnection,
+    code_hash: &str,
+    client_id: &str,
+    user_id: i64,
+    redirect_uri: &str,
+    code_challenge: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,code_challenge,expires_at) VALUES(?,?,?,?,?,?)",
+        [
+            code_hash.into(),
+            client_id.into(),
+            user_id.into(),
+            redirect_uri.into(),
+            code_challenge.into(),
+            (now + Duration::minutes(5)).to_rfc3339().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn redeem_oauth_code(
+    db: &DatabaseConnection,
+    code_hash: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<Option<(i64, String)>> {
+    let transaction = db.begin().await?;
+    let Some(row) = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id,user_id,redirect_uri,code_challenge FROM oauth_codes WHERE code_hash=? AND client_id=? AND expires_at>? AND used_at IS NULL",
+            [
+                code_hash.into(),
+                client_id.into(),
+                Utc::now().to_rfc3339().into(),
+            ],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let stored_redirect: String = row.try_get("", "redirect_uri")?;
+    if stored_redirect != redirect_uri {
+        return Ok(None);
+    }
+    let id: i64 = row.try_get("", "id")?;
+    let result = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE oauth_codes SET used_at=? WHERE id=? AND used_at IS NULL",
+            [Utc::now().to_rfc3339().into(), id.into()],
+        ))
+        .await?;
+    if result.rows_affected() != 1 {
+        return Ok(None);
+    }
+    transaction.commit().await?;
+    Ok(Some((
+        row.try_get("", "user_id")?,
+        row.try_get("", "code_challenge")?,
+    )))
+}
+
+pub async fn create_oauth_tokens(
+    db: &DatabaseConnection,
+    client_id: &str,
+    user_id: i64,
+) -> anyhow::Result<(String, String, i64)> {
+    let access = auth::new_session_token();
+    let refresh = auth::new_session_token();
+    let now = Utc::now();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO oauth_tokens(access_token_hash,refresh_token_hash,client_id,user_id,access_expires_at,refresh_expires_at) VALUES(?,?,?,?,?,?)",
+        [
+            auth::token_hash(&access).into(),
+            auth::token_hash(&refresh).into(),
+            client_id.into(),
+            user_id.into(),
+            (now + Duration::hours(1)).to_rfc3339().into(),
+            (now + Duration::days(30)).to_rfc3339().into(),
+        ],
+    ))
+    .await?;
+    Ok((access, refresh, 3600))
+}
+
+pub async fn resolve_oauth_access_token(
+    db: &DatabaseConnection,
+    token: &str,
+) -> anyhow::Result<Option<UserAccount>> {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT u.id,u.household_id,u.username,u.email,u.display_name FROM oauth_tokens t JOIN users u ON u.id=t.user_id WHERE t.access_token_hash=? AND t.access_expires_at>? AND t.revoked_at IS NULL",
+        [
+            auth::token_hash(token).into(),
+            Utc::now().to_rfc3339().into(),
+        ],
+    ))
+    .await?
+    .map(user_from_row)
+    .transpose()
+}
+
+pub async fn refresh_oauth_tokens(
+    db: &DatabaseConnection,
+    refresh_token: &str,
+    client_id: &str,
+) -> anyhow::Result<Option<(String, String, i64)>> {
+    let hash = auth::token_hash(refresh_token);
+    let Some(row) = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT user_id FROM oauth_tokens WHERE refresh_token_hash=? AND client_id=? AND refresh_expires_at>? AND revoked_at IS NULL",
+            [hash.clone().into(), client_id.into(), Utc::now().to_rfc3339().into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE oauth_tokens SET revoked_at=? WHERE refresh_token_hash=?",
+        [Utc::now().to_rfc3339().into(), hash.into()],
+    ))
+    .await?;
+    Ok(Some(
+        create_oauth_tokens(db, client_id, row.try_get("", "user_id")?).await?,
+    ))
+}
+
+pub async fn create_oauth_device_code(
+    db: &DatabaseConnection,
+    device_code_hash: &str,
+    user_code_hash: &str,
+    client_id: &str,
+    code_challenge: &str,
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO oauth_device_codes(device_code_hash,user_code_hash,client_id,code_challenge,expires_at) VALUES(?,?,?,?,?)",
+        [
+            device_code_hash.into(),
+            user_code_hash.into(),
+            client_id.into(),
+            code_challenge.into(),
+            (Utc::now() + Duration::minutes(10)).to_rfc3339().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn oauth_device_code_state(
+    db: &DatabaseConnection,
+    device_code_hash: &str,
+    client_id: &str,
+) -> anyhow::Result<Option<(Option<i64>, String)>> {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT user_id,code_challenge FROM oauth_device_codes WHERE device_code_hash=? AND client_id=? AND expires_at>? AND consumed_at IS NULL",
+        [
+            device_code_hash.into(),
+            client_id.into(),
+            Utc::now().to_rfc3339().into(),
+        ],
+    ))
+    .await?
+    .map(|row| {
+        Ok((
+            row.try_get("", "user_id")?,
+            row.try_get("", "code_challenge")?,
+        ))
+    })
+    .transpose()
+}
+
+pub async fn oauth_device_user_code_exists(
+    db: &DatabaseConnection,
+    user_code_hash: &str,
+) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id FROM oauth_device_codes WHERE user_code_hash=? AND expires_at>? AND consumed_at IS NULL",
+            [user_code_hash.into(), Utc::now().to_rfc3339().into()],
+        ))
+        .await?
+        .is_some())
+}
+
+pub async fn approve_oauth_device_code(
+    db: &DatabaseConnection,
+    user_code_hash: &str,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE oauth_device_codes SET user_id=?,approved_at=? WHERE user_code_hash=? AND expires_at>? AND approved_at IS NULL AND consumed_at IS NULL",
+            [
+                user_id.into(),
+                Utc::now().to_rfc3339().into(),
+                user_code_hash.into(),
+                Utc::now().to_rfc3339().into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn consume_oauth_device_code(
+    db: &DatabaseConnection,
+    device_code_hash: &str,
+    client_id: &str,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE oauth_device_codes SET consumed_at=? WHERE device_code_hash=? AND client_id=? AND user_id=? AND expires_at>? AND consumed_at IS NULL",
+            [
+                Utc::now().to_rfc3339().into(),
+                device_code_hash.into(),
+                client_id.into(),
+                user_id.into(),
+                Utc::now().to_rfc3339().into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn update_password_and_revoke_sessions(

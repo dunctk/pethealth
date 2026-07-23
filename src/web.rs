@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/favicon.ico", get(favicon))
         .route("/static/app.css", get(css))
+        .route("/static/app.js", get(js))
         .route("/login", get(login_page).post(login))
         .route("/register", get(register_page).post(register))
         .route("/share/{token}", get(shared_pet))
@@ -74,7 +75,12 @@ struct LoginPageQuery {
     next: Option<String>,
 }
 
-async fn login_page(Query(query): Query<LoginPageQuery>) -> Result<Html<String>, AppError> {
+async fn login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LoginPageQuery>,
+) -> Result<Html<String>, AppError> {
+    let origin = request_origin(&state, &headers);
     render(&LoginTemplate {
         identifier: String::new(),
         error: None,
@@ -83,6 +89,8 @@ async fn login_page(Query(query): Query<LoginPageQuery>) -> Result<Html<String>,
             .unwrap_or(false)
             .then(|| "Password updated. Sign in again on this device.".into()),
         next: query.next,
+        mcp_url: format!("{origin}/mcp"),
+        device_url: format!("{origin}/oauth/device"),
     })
 }
 
@@ -116,12 +124,15 @@ async fn login(
         None
     };
     let Some(user) = valid else {
+        let origin = request_origin(&state, &headers);
         return render_status(
             &LoginTemplate {
                 identifier,
                 error: Some("Email/username or password is incorrect.".into()),
                 notice: None,
                 next: form.next,
+                mcp_url: format!("{origin}/mcp"),
+                device_url: format!("{origin}/oauth/device"),
             },
             StatusCode::UNPROCESSABLE_ENTITY,
         );
@@ -236,6 +247,7 @@ struct IndexQuery {
 
 async fn index(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(user): Extension<UserAccount>,
     Query(query): Query<IndexQuery>,
 ) -> Result<Html<String>, AppError> {
@@ -266,6 +278,7 @@ async fn index(
         Some(pet) => db::list_lab_reports(&state.db, user.household_id, pet.id).await?,
         None => Vec::new(),
     };
+    let origin = request_origin(&state, &headers);
     render(&ConsoleTemplate {
         user,
         pets,
@@ -279,6 +292,8 @@ async fn index(
         new_share_path: None,
         capture_message: None,
         capture_error: None,
+        mcp_url: format!("{origin}/mcp"),
+        device_url: format!("{origin}/oauth/device"),
     })
 }
 
@@ -534,6 +549,16 @@ async fn shared_pet(
 async fn css() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], CSS)
 }
+
+async fn js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/app.js"),
+    )
+}
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -687,6 +712,23 @@ fn safe_login_next(next: Option<&str>) -> Option<&str> {
     })
 }
 
+fn request_origin(state: &AppState, headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .unwrap_or(if state.config.production {
+            "https"
+        } else {
+            "http"
+        });
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:3000");
+    format!("{scheme}://{host}")
+}
+
 fn same_origin(method: &Method, headers: &HeaderMap) -> bool {
     if matches!(*method, Method::GET | Method::HEAD) {
         return true;
@@ -745,6 +787,8 @@ struct ConsoleTemplate {
     new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,
+    mcp_url: String,
+    device_url: String,
 }
 
 #[derive(Template)]
@@ -754,6 +798,8 @@ struct LoginTemplate {
     error: Option<String>,
     notice: Option<String>,
     next: Option<String>,
+    mcp_url: String,
+    device_url: String,
 }
 
 #[derive(Template)]

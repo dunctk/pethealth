@@ -1,0 +1,14 @@
+<section class="mcp-connect" aria-labelledby="mcp-connect-title">
+  <div class="mcp-connect-top"><span class="side-label">CONNECT AN AI ASSISTANT</span><span class="mcp-ready">READY</span></div>
+  <h2 id="mcp-connect-title">Connect Claude, Codex, or another agent</h2>
+  <p>Copy this URL. Paste it into Claude Cowork, Claude Code, Codex, or another client's <strong>Add MCP server</strong> box. It will ask you to sign in.</p>
+  <div class="mcp-url-row">
+    <input id="mcp-url" readonly value="{{ mcp_url }}" aria-label="Pet Health MCP server URL">
+    <button class="button secondary" type="button" data-copy-target="#mcp-url">Copy URL</button>
+  </div>
+  <div class="mcp-client-list" aria-label="Works with"><span>CLAUDE COWORK</span><span>CLAUDE CODE</span><span>CODEX</span></div>
+  <details class="mcp-help">
+    <summary>No browser on this computer?</summary>
+    <p>Start the connection in your terminal. Open <a href="{{ device_url }}">this page</a> on your phone or another computer, then enter the one-time code your client shows you.</p>
+  </details>
+</section>

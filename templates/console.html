@@ -7,6 +7,7 @@
   <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
   <title>Pet Health</title>
   <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V" crossorigin="anonymous"></script>
 </head>
 <body>
@@ -62,6 +63,7 @@
     </main>
 
     <aside class="context-panel">
+      {% include "_mcp_connect.html" %}
       <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div></section>
       {% match knowledge %}
       {% when Some with (article) %}

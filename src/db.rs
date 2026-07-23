@@ -1,7 +1,8 @@
 use crate::{
     auth,
     domain::{
-        DEFAULT_HOUSEHOLD_ID, HealthEvent, KnowledgeArticle, Pet, ProposedEvent, ShareGrant,
+        ClinicalTimeline, DEFAULT_HOUSEHOLD_ID, HealthEvent, KnowledgeArticle,
+        MedicationAdministration, Pet, ProposedEvent, ShareGrant, SymptomObservation, TemporalLink,
         UserAccount, event_presentation,
     },
 };
@@ -121,6 +122,46 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
             ON health_events(household_id, pet_id, occurred_at DESC);
         CREATE INDEX IF NOT EXISTS idx_events_tenant_concept
             ON health_events(household_id, concept, occurred_at DESC);
+        CREATE TABLE IF NOT EXISTS symptom_observations (
+            event_id INTEGER PRIMARY KEY,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            episode_id TEXT NOT NULL,
+            symptom TEXT NOT NULL,
+            occurrence_count INTEGER,
+            amount TEXT,
+            contents TEXT,
+            meal_relation TEXT,
+            water_status TEXT,
+            appetite_status TEXT,
+            energy_status TEXT,
+            pain_status TEXT,
+            note TEXT,
+            FOREIGN KEY (event_id) REFERENCES health_events(id) ON DELETE CASCADE,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_symptoms_tenant_pet_episode
+            ON symptom_observations(household_id, pet_id, symptom, episode_id);
+        CREATE TABLE IF NOT EXISTS medication_administrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            active_ingredient TEXT,
+            dose_value REAL,
+            dose_unit TEXT,
+            route TEXT,
+            scheduled_at TEXT,
+            administered_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'given',
+            raw_input TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_meds_tenant_pet_time
+            ON medication_administrations(household_id, pet_id, administered_at DESC);
         CREATE TABLE IF NOT EXISTS audit_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             household_id INTEGER NOT NULL,
@@ -1027,6 +1068,186 @@ pub async fn create_health_event(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn create_symptom_event(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    raw_input: &str,
+    occurred_at: DateTime<Utc>,
+    symptom: &str,
+    occurrence_count: Option<i64>,
+    amount: Option<&str>,
+    contents: Option<&str>,
+    meal_relation: Option<&str>,
+    water_status: Option<&str>,
+    appetite_status: Option<&str>,
+    energy_status: Option<&str>,
+    pain_status: Option<&str>,
+    note: Option<&str>,
+    source: &str,
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"INSERT INTO health_events
+           (household_id,pet_id,event_type,concept,summary,raw_input,details,occurred_at,recorded_at,temporal_precision,source)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+        [
+            household_id.into(), pet.id.into(), "symptom".into(), symptom.into(),
+            symptom_summary(symptom).into(), raw_input.into(), note.map(str::to_owned).into(),
+            occurred_at.to_rfc3339().into(), now.clone().into(), "exact".into(), source.into(),
+        ],
+    )).await?.ok_or_else(|| anyhow!("symptom event insert returned no id"))?;
+    let event_id: i64 = row.try_get("", "id")?;
+    let episode_id = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT s.episode_id FROM symptom_observations s
+           JOIN health_events e ON e.id=s.event_id
+           WHERE s.household_id=? AND s.pet_id=? AND s.symptom=? AND e.status='active'
+             AND e.occurred_at>=? ORDER BY e.occurred_at DESC LIMIT 1"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                symptom.into(),
+                (occurred_at - Duration::hours(6)).to_rfc3339().into(),
+            ],
+        ))
+        .await?
+        .map(|existing| existing.try_get("", "episode_id"))
+        .transpose()?
+        .unwrap_or_else(|| format!("episode-{event_id}"));
+    transaction.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"INSERT INTO symptom_observations
+           (event_id,household_id,pet_id,episode_id,symptom,occurrence_count,amount,contents,meal_relation,water_status,appetite_status,energy_status,pain_status,note)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+        [
+            event_id.into(), household_id.into(), pet.id.into(), episode_id.into(), symptom.into(),
+            occurrence_count.into(), amount.into(), contents.into(), meal_relation.into(),
+            water_status.into(), appetite_status.into(), energy_status.into(), pain_status.into(),
+            note.into(),
+        ],
+    )).await?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "event.created",
+        "health_event",
+        event_id,
+        raw_input,
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(event_id)
+}
+
+fn symptom_summary(symptom: &str) -> &str {
+    match symptom {
+        "vomiting" => "Vomited",
+        "diarrhea" => "Had diarrhea",
+        "reduced_appetite" => "Reduced appetite",
+        _ => "Symptom recorded",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_medication_administration(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    name: &str,
+    active_ingredient: Option<&str>,
+    dose_value: Option<f64>,
+    dose_unit: Option<&str>,
+    route: Option<&str>,
+    administered_at: DateTime<Utc>,
+    scheduled_at: Option<DateTime<Utc>>,
+    status: &str,
+    raw_input: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"INSERT INTO medication_administrations
+           (household_id,pet_id,name,active_ingredient,dose_value,dose_unit,route,scheduled_at,administered_at,status,raw_input,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+        [
+            household_id.into(), pet.id.into(), name.into(), active_ingredient.into(),
+            dose_value.into(), dose_unit.into(), route.into(), scheduled_at.map(|at| at.to_rfc3339()).into(),
+            administered_at.to_rfc3339().into(), status.into(), raw_input.into(), now.clone().into(),
+        ],
+    )).await?.ok_or_else(|| anyhow!("medication insert returned no id"))?;
+    let id: i64 = row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "medication.created",
+        "medication_administration",
+        id,
+        name,
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(id)
+}
+
+pub async fn list_medications(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    limit: u64,
+) -> anyhow::Result<Vec<MedicationAdministration>> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT m.*,p.name AS pet_name FROM medication_administrations m
+           JOIN pets p ON p.id=m.pet_id WHERE m.household_id=? AND m.pet_id=?
+           ORDER BY m.administered_at DESC LIMIT ?"#,
+            [household_id.into(), pet_id.into(), limit.into()],
+        ))
+        .await?;
+    rows.into_iter().map(medication_from_row).collect()
+}
+
+pub async fn clinical_timeline(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    limit: u64,
+) -> anyhow::Result<ClinicalTimeline> {
+    let events = list_events(db, household_id, Some(pet_id), limit).await?;
+    let medications = list_medications(db, household_id, pet_id, limit).await?;
+    let temporal_links = events
+        .iter()
+        .filter(|event| event.symptom.is_some())
+        .flat_map(|event| {
+            medications.iter().filter_map(move |medication| {
+                let minutes = (event.occurred_at - medication.administered_at).num_minutes();
+                (0..=4_320).contains(&minutes).then_some(TemporalLink {
+                    event_id: event.id,
+                    medication_id: medication.id,
+                    minutes_after_medication: minutes,
+                })
+            })
+        })
+        .collect();
+    Ok(ClinicalTimeline {
+        events,
+        medications,
+        temporal_links,
+    })
+}
+
 pub async fn undo_event(
     db: &DatabaseConnection,
     household_id: i64,
@@ -1065,13 +1286,23 @@ pub async fn list_events(
 ) -> anyhow::Result<Vec<HealthEvent>> {
     let (sql, values) = if let Some(pet_id) = pet_id {
         (
-            r#"SELECT e.*,p.name AS pet_name FROM health_events e JOIN pets p ON p.id=e.pet_id
+            r#"SELECT e.*,p.name AS pet_name,
+                s.episode_id AS symptom_episode_id,s.symptom AS symptom_kind,s.occurrence_count AS symptom_occurrence_count,
+                s.amount AS symptom_amount,s.contents AS symptom_contents,s.meal_relation AS symptom_meal_relation,
+                s.water_status AS symptom_water_status,s.appetite_status AS symptom_appetite_status,
+                s.energy_status AS symptom_energy_status,s.pain_status AS symptom_pain_status,s.note AS symptom_note
+            FROM health_events e JOIN pets p ON p.id=e.pet_id LEFT JOIN symptom_observations s ON s.event_id=e.id
             WHERE e.household_id=? AND e.pet_id=? AND e.status='active' ORDER BY e.occurred_at DESC LIMIT ?"#,
             vec![household_id.into(), pet_id.into(), limit.into()],
         )
     } else {
         (
-            r#"SELECT e.*,p.name AS pet_name FROM health_events e JOIN pets p ON p.id=e.pet_id
+            r#"SELECT e.*,p.name AS pet_name,
+                s.episode_id AS symptom_episode_id,s.symptom AS symptom_kind,s.occurrence_count AS symptom_occurrence_count,
+                s.amount AS symptom_amount,s.contents AS symptom_contents,s.meal_relation AS symptom_meal_relation,
+                s.water_status AS symptom_water_status,s.appetite_status AS symptom_appetite_status,
+                s.energy_status AS symptom_energy_status,s.pain_status AS symptom_pain_status,s.note AS symptom_note
+            FROM health_events e JOIN pets p ON p.id=e.pet_id LEFT JOIN symptom_observations s ON s.event_id=e.id
             WHERE e.household_id=? AND e.status='active' ORDER BY e.occurred_at DESC LIMIT ?"#,
             vec![household_id.into(), limit.into()],
         )
@@ -1292,6 +1523,23 @@ fn event_from_row(row: QueryResult) -> anyhow::Result<HealthEvent> {
     let recorded_at = DateTime::parse_from_rfc3339(&row.try_get::<String>("", "recorded_at")?)?
         .with_timezone(&Utc);
     let (icon, tone) = event_presentation(&event_type, &concept);
+    let symptom = match row.try_get::<Option<String>>("", "symptom_episode_id")? {
+        Some(episode_id) => Some(SymptomObservation {
+            event_id: row.try_get("", "id")?,
+            episode_id,
+            symptom: row.try_get("", "symptom_kind")?,
+            occurrence_count: row.try_get("", "symptom_occurrence_count")?,
+            amount: row.try_get("", "symptom_amount")?,
+            contents: row.try_get("", "symptom_contents")?,
+            meal_relation: row.try_get("", "symptom_meal_relation")?,
+            water_status: row.try_get("", "symptom_water_status")?,
+            appetite_status: row.try_get("", "symptom_appetite_status")?,
+            energy_status: row.try_get("", "symptom_energy_status")?,
+            pain_status: row.try_get("", "symptom_pain_status")?,
+            note: row.try_get("", "symptom_note")?,
+        }),
+        None => None,
+    };
     Ok(HealthEvent {
         id: row.try_get("", "id")?,
         pet_id: row.try_get("", "pet_id")?,
@@ -1308,6 +1556,31 @@ fn event_from_row(row: QueryResult) -> anyhow::Result<HealthEvent> {
         status: row.try_get("", "status")?,
         icon,
         tone,
+        symptom,
+    })
+}
+
+fn medication_from_row(row: QueryResult) -> anyhow::Result<MedicationAdministration> {
+    let parse_at =
+        |value: String| DateTime::parse_from_rfc3339(&value).map(|at| at.with_timezone(&Utc));
+    let administered_at = parse_at(row.try_get("", "administered_at")?)?;
+    let scheduled_at = row
+        .try_get::<Option<String>>("", "scheduled_at")?
+        .map(parse_at)
+        .transpose()?;
+    Ok(MedicationAdministration {
+        id: row.try_get("", "id")?,
+        pet_id: row.try_get("", "pet_id")?,
+        pet_name: row.try_get("", "pet_name")?,
+        name: row.try_get("", "name")?,
+        active_ingredient: row.try_get("", "active_ingredient")?,
+        dose_value: row.try_get("", "dose_value")?,
+        dose_unit: row.try_get("", "dose_unit")?,
+        route: row.try_get("", "route")?,
+        administered_at,
+        scheduled_at,
+        status: row.try_get("", "status")?,
+        raw_input: row.try_get("", "raw_input")?,
     })
 }
 
@@ -1407,6 +1680,80 @@ mod tests {
             list_events(&db, 1, Some(pet_id), 20)
                 .await
                 .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn clinical_timeline_keeps_symptom_facts_and_links_recent_medication() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        let medication_at = Utc::now() - Duration::minutes(30);
+        let medication_id = create_medication_administration(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "anti-nausea medicine",
+            Some("anti-nausea ingredient"),
+            Some(8.0),
+            Some("mg"),
+            Some("oral"),
+            medication_at,
+            None,
+            "given",
+            Some("Gave anti-nausea medicine 30 minutes before vomiting"),
+        )
+        .await
+        .unwrap();
+        let event_id = create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited again at earlier",
+            medication_at + Duration::minutes(30),
+            "vomiting",
+            Some(1),
+            Some("small"),
+            Some("food"),
+            Some("after meal"),
+            Some("drank"),
+            Some("normal"),
+            Some("normal"),
+            Some("unknown"),
+            Some("Owner recorded the episode"),
+            "owner_form",
+        )
+        .await
+        .unwrap();
+
+        let timeline = clinical_timeline(&db, 1, pet_id, 20).await.unwrap();
+        assert_eq!(timeline.events[0].id, event_id);
+        assert_eq!(
+            timeline.events[0].raw_input,
+            "Milo vomited again at earlier"
+        );
+        assert_eq!(
+            timeline.events[0]
+                .symptom
+                .as_ref()
+                .unwrap()
+                .contents
+                .as_deref(),
+            Some("food")
+        );
+        assert_eq!(timeline.medications[0].id, medication_id);
+        assert_eq!(timeline.temporal_links.len(), 1);
+        assert_eq!(timeline.temporal_links[0].minutes_after_medication, 30);
+        assert!(
+            clinical_timeline(&db, 2, pet_id, 20)
+                .await
+                .unwrap()
+                .events
                 .is_empty()
         );
     }

@@ -1,6 +1,9 @@
 use crate::{
     AppState, auth, db,
-    domain::{HealthEvent, KnowledgeArticle, LabReport, Pet, ShareGrant, UserAccount, WeightEntry},
+    domain::{
+        HealthEvent, KnowledgeArticle, LabReport, MedicationAdministration, Pet, ShareGrant,
+        UserAccount, WeightEntry,
+    },
     ocr,
 };
 use askama::Template;
@@ -22,6 +25,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
+        .route("/symptoms", post(create_symptom))
+        .route("/medications", post(create_medication))
         .route("/blood-tests/upload", post(upload_blood_test))
         .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
@@ -284,6 +289,10 @@ async fn index(
         Some(pet) => db::list_lab_reports(&state.db, user.household_id, pet.id).await?,
         None => Vec::new(),
     };
+    let medications = match &selected_pet {
+        Some(pet) => db::list_medications(&state.db, user.household_id, pet.id, 20).await?,
+        None => Vec::new(),
+    };
     let origin = request_origin(&state, &headers);
     render(&ConsoleTemplate {
         user,
@@ -295,6 +304,7 @@ async fn index(
         shares,
         weights,
         lab_reports,
+        medications,
         new_share_path: None,
         capture_message: None,
         capture_error: None,
@@ -381,6 +391,114 @@ async fn create_weight(
     )
     .await?;
     Ok(Redirect::to(&format!("/?pet={}", form.pet_id)))
+}
+
+#[derive(Deserialize)]
+struct SymptomForm {
+    pet_id: i64,
+    symptom: String,
+    raw_input: String,
+    occurrence_count: Option<i64>,
+    amount: Option<String>,
+    contents: Option<String>,
+    meal_relation: Option<String>,
+    water_status: Option<String>,
+    appetite_status: Option<String>,
+    energy_status: Option<String>,
+    pain_status: Option<String>,
+    note: Option<String>,
+}
+
+async fn create_symptom(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<SymptomForm>,
+) -> Result<Response, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let symptom = clean_required(&form.symptom, 60, "Symptom")?;
+    if !matches!(symptom, "vomiting" | "diarrhea" | "reduced_appetite") {
+        return Err(AppError::validation("Choose a supported symptom."));
+    }
+    let count = form
+        .occurrence_count
+        .filter(|value| (1..=100).contains(value));
+    let raw_input = clean_required(&form.raw_input, 1000, "Original wording")?;
+    db::create_symptom_event(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        raw_input,
+        Utc::now(),
+        symptom,
+        count,
+        clean_optional(form.amount.as_deref(), 60),
+        clean_optional(form.contents.as_deref(), 120),
+        clean_optional(form.meal_relation.as_deref(), 60),
+        clean_optional(form.water_status.as_deref(), 60),
+        clean_optional(form.appetite_status.as_deref(), 60),
+        clean_optional(form.energy_status.as_deref(), 60),
+        clean_optional(form.pain_status.as_deref(), 60),
+        clean_optional(form.note.as_deref(), 500),
+        "owner_form",
+    )
+    .await?;
+    let events = db::list_events(&state.db, user.household_id, Some(pet.id), 50).await?;
+    render(&AgentTimelineTemplate {
+        selected_pet: Some(pet),
+        events,
+        capture_message: Some("Saved structured symptom record.".into()),
+        capture_error: None,
+    })
+    .map(IntoResponse::into_response)
+}
+
+#[derive(Deserialize)]
+struct MedicationForm {
+    pet_id: i64,
+    name: String,
+    active_ingredient: Option<String>,
+    dose_value: Option<f64>,
+    dose_unit: Option<String>,
+    route: Option<String>,
+    status: Option<String>,
+    note: Option<String>,
+}
+
+async fn create_medication(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<MedicationForm>,
+) -> Result<Redirect, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let name = clean_required(&form.name, 120, "Medication")?;
+    let status = clean_optional(form.status.as_deref(), 30).unwrap_or("given");
+    if !matches!(status, "given" | "missed" | "extra" | "vomited_back") {
+        return Err(AppError::validation(
+            "Choose a supported medication status.",
+        ));
+    }
+    db::create_medication_administration(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        name,
+        clean_optional(form.active_ingredient.as_deref(), 120),
+        form.dose_value,
+        clean_optional(form.dose_unit.as_deref(), 30),
+        clean_optional(form.route.as_deref(), 40),
+        Utc::now(),
+        None,
+        status,
+        clean_optional(form.note.as_deref(), 500),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
 }
 
 async fn import_blood_tests(
@@ -829,6 +947,7 @@ struct ConsoleTemplate {
     shares: Vec<ShareGrant>,
     weights: Vec<WeightEntry>,
     lab_reports: Vec<LabReport>,
+    medications: Vec<MedicationAdministration>,
     new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,

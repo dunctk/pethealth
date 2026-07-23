@@ -8,6 +8,27 @@
     {% match capture_error %}{% when Some with (message) %}<div class="capture-result error" role="alert"><span>!</span>{{ message }}</div>{% when None %}{% endmatch %}
   </form>
 
+  {% match selected_pet %}{% when Some with (pet) %}
+  <details class="structured-capture">
+    <summary><span class="structured-pulse">+</span><span><b>Structured symptom record</b><small>Keep details useful for a vet and an AI assistant</small></span></summary>
+    <form class="structured-form" hx-post="/symptoms" hx-target="#agent-and-timeline" hx-swap="outerHTML">
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
+      <label>Symptom<select name="symptom"><option value="vomiting">Vomiting</option><option value="diarrhea">Diarrhea</option><option value="reduced_appetite">Reduced appetite</option></select></label>
+      <label>Original wording<input required maxlength="1000" name="raw_input" value="{{ pet.name }} vomited just now"></label>
+      <label>Count<input type="number" min="1" max="100" name="occurrence_count" placeholder="1"></label>
+      <label>Amount<select name="amount"><option value="">Not sure</option><option>small</option><option>medium</option><option>large</option></select></label>
+      <label>Contents<select name="contents"><option value="">Not sure</option><option>food</option><option>foam</option><option>bile</option><option>hair</option><option>blood</option><option>foreign material</option></select></label>
+      <label>Meal timing<select name="meal_relation"><option value="">Not sure</option><option>before eating</option><option>soon after eating</option><option>long after eating</option></select></label>
+      <label>Water afterward<select name="water_status"><option value="">Not recorded</option><option>kept water down</option><option>vomited water</option><option>did not drink</option></select></label>
+      <label>Appetite<select name="appetite_status"><option value="">Not recorded</option><option>normal</option><option>reduced</option><option>refused food</option></select></label>
+      <label>Energy<select name="energy_status"><option value="">Not recorded</option><option>normal</option><option>quiet</option><option>lethargic</option></select></label>
+      <label>Pain<select name="pain_status"><option value="">Not recorded</option><option>none noticed</option><option>possible</option><option>obvious</option></select></label>
+      <label class="full-width">Extra note <span class="field-hint">optional</span><textarea name="note" maxlength="500" rows="2" placeholder="Anything else you saw"></textarea></label>
+      <button class="button secondary full-width" type="submit">Save with current time</button>
+    </form>
+  </details>
+  {% when None %}{% endmatch %}
+
   <section id="timeline-region" class="timeline-region" aria-live="polite">
     <div class="section-head"><div><span class="eyebrow">HEALTH HISTORY</span><h2>Timeline</h2></div><span>{{ events.len() }} event{% if events.len() != 1 %}s{% endif %}</span></div>
     {% if events.is_empty() %}
@@ -19,6 +40,7 @@
           <div class="event-rail"><span class="event-icon {{ event.tone }}">{{ event.icon }}</span><i></i></div>
           <div class="event-body"><div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at }}">{{ event.occurred_label }}</time></div>
             <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>{% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
+            {% match event.symptom %}{% when Some with (symptom) %}<div class="symptom-facts"><span class="fact-label">STRUCTURED FACTS</span>{% match symptom.occurrence_count %}{% when Some with (count) %}<span>{{ count }}×</span>{% when None %}{% endmatch %}{% match symptom.amount %}{% when Some with (amount) %}<span>{{ amount }}</span>{% when None %}{% endmatch %}{% match symptom.contents %}{% when Some with (contents) %}<span>{{ contents }}</span>{% when None %}{% endmatch %}{% match symptom.water_status %}{% when Some with (water) %}<span>{{ water }}</span>{% when None %}{% endmatch %}</div>{% when None %}{% endmatch %}
           </div>
           <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
         </article>

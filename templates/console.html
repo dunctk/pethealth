@@ -104,6 +104,23 @@
         <div class="weight-list">{% for weight in weights %}<div class="weight-row"><strong>{{ weight.weight_kg }} kg</strong><span>{{ weight.measured_at }}{% match weight.note %}{% when Some with (note) %}<small>{{ note }}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>
         {% endif %}
       </section>
+      <section class="tracker-box medication-box">
+        <div class="side-label">MEDICATION TIMELINE</div>
+        <h2>Log a dose</h2>
+        <p>Record what was actually given. Exact product and dose timing help spot patterns without guessing cause.</p>
+        <form method="post" action="/medications" class="tracker-form">
+          <input type="hidden" name="pet_id" value="{{ pet.id }}">
+          <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="anti-nausea medicine 16 mg tablet"></label>
+          <label>Active ingredient<input maxlength="120" name="active_ingredient" placeholder="anti-nausea ingredient"></label>
+          <label>Dose<input type="number" min="0" step="0.001" name="dose_value" placeholder="16"></label>
+          <label>Unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
+          <label>Route<select name="route"><option value="">Not recorded</option><option>by mouth</option><option>injection</option><option>topical</option><option>other</option></select></label>
+          <label>Status<select name="status"><option value="given">Given</option><option value="missed">Missed</option><option value="extra">Extra dose</option><option value="vomited_back">Vomited back</option></select></label>
+          <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="500" name="note" placeholder="With food"></label>
+          <button class="button secondary full-width" type="submit">Save dose with current time</button>
+        </form>
+        {% if medications.is_empty() %}<p class="tracker-empty">No medication exposures recorded yet.</p>{% else %}<div class="medication-list">{% for medication in medications %}<div class="medication-row"><strong>{{ medication.name }}</strong><span>{{ medication.administered_at.format("%d %b, %H:%M") }}{% match medication.dose_value %}{% when Some with (dose) %}<small>{{ dose }}{% match medication.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>{% endif %}
+      </section>
       <section class="tracker-box lab-box">
         <div class="side-label">BLOOD TESTS</div>
         <h2>Bring in a lab report</h2>

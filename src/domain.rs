@@ -47,6 +47,53 @@ pub struct HealthEvent {
     pub occurred_label: String,
     pub icon: &'static str,
     pub tone: &'static str,
+    pub symptom: Option<SymptomObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SymptomObservation {
+    pub event_id: i64,
+    pub episode_id: String,
+    pub symptom: String,
+    pub occurrence_count: Option<i64>,
+    pub amount: Option<String>,
+    pub contents: Option<String>,
+    pub meal_relation: Option<String>,
+    pub water_status: Option<String>,
+    pub appetite_status: Option<String>,
+    pub energy_status: Option<String>,
+    pub pain_status: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MedicationAdministration {
+    pub id: i64,
+    pub pet_id: i64,
+    pub pet_name: String,
+    pub name: String,
+    pub active_ingredient: Option<String>,
+    pub dose_value: Option<f64>,
+    pub dose_unit: Option<String>,
+    pub route: Option<String>,
+    pub administered_at: DateTime<Utc>,
+    pub scheduled_at: Option<DateTime<Utc>>,
+    pub status: String,
+    pub raw_input: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemporalLink {
+    pub event_id: i64,
+    pub medication_id: i64,
+    pub minutes_after_medication: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClinicalTimeline {
+    pub events: Vec<HealthEvent>,
+    pub medications: Vec<MedicationAdministration>,
+    pub temporal_links: Vec<TemporalLink>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -9,7 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use base64::Engine;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -686,11 +686,14 @@ fn tool_list() -> Value {
     json!({"tools":[
         {"name":"list_pets","description":"List the pets in the signed-in household.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}},
         {"name":"get_pet_timeline","description":"Read active health events for one pet. The original wording is included.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
+        {"name":"get_clinical_timeline","description":"Read a pet's symptoms, medications, and neutral time links between them. This is context for a vet, not a diagnosis.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_health_context","description":"Read practical care context for a health concept. This is not a diagnosis.","inputSchema":{"type":"object","properties":{"concept":{"type":"string"}},"required":["concept"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_weight_history","description":"Read weight measurements over time for one pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_blood_test_history","description":"Read imported blood-test values for one pet. Original reports remain stored for review.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"add_pet","description":"Add a pet to the signed-in household.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"species":{"type":"string"},"breed":{"type":"string"},"weight_kg":{"type":"number"}},"required":["name","species"]}},
         {"name":"record_weight","description":"Save a weight measurement for a pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"weight_kg":{"type":"number"},"measured_at":{"type":"string","description":"YYYY-MM-DD"},"note":{"type":"string"}},"required":["pet_id","weight_kg","measured_at"]}},
+        {"name":"record_symptom_event","description":"Record a structured symptom using the user's original wording. The server timestamps it now or by relative minutes_ago; absolute timestamps are not accepted from the model.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"message":{"type":"string"},"symptom":{"type":"string","enum":["vomiting","diarrhea","reduced_appetite"]},"minutes_ago":{"type":"integer","minimum":0,"maximum":525600},"occurrence_count":{"type":"integer","minimum":1,"maximum":100},"amount":{"type":"string"},"contents":{"type":"string"},"meal_relation":{"type":"string"},"water_status":{"type":"string"},"appetite_status":{"type":"string"},"energy_status":{"type":"string"},"pain_status":{"type":"string"},"note":{"type":"string"}},"required":["pet_id","message","symptom"]}},
+        {"name":"record_medication","description":"Record a medication exposure. The server timestamps administration now or by relative minutes_ago; include the exact product, active ingredient, strength, dose, route, and whether it was given, missed, extra, or vomited back.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"name":{"type":"string"},"active_ingredient":{"type":"string"},"dose_value":{"type":"number"},"dose_unit":{"type":"string"},"route":{"type":"string"},"minutes_ago":{"type":"integer","minimum":0,"maximum":525600},"status":{"type":"string","enum":["given","missed","extra","vomited_back"]},"message":{"type":"string"}},"required":["pet_id","name"]}},
         {"name":"upload_blood_test","description":"Store one PDF or image in this household's private area and import it with Mistral OCR 4.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"},"content_base64":{"type":"string","description":"The PDF or image bytes encoded as base64."}},"required":["filename","content_base64"]}},
         {"name":"import_blood_tests","description":"OCR new PDF and image files from this household's private blood-test folder using Mistral OCR 4.","inputSchema":{"type":"object","properties":{} }},
         {"name":"record_health_event","description":"Record one observation from the user's wording. The server chooses the timestamp and preserves the original wording.","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
@@ -736,6 +739,30 @@ async fn call_tool(
                 db::list_events(&state.db, user.household_id, Some(pet_id), limit)
                     .await
                     .map_err(internal)?,
+            )
+            .map_err(internal)?
+        }
+        "get_clinical_timeline" => {
+            let pet_id = integer(&args, "pet_id")?;
+            if db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err((-32602, "That pet is not in this household.".into()));
+            }
+            serde_json::to_value(
+                db::clinical_timeline(
+                    &state.db,
+                    user.household_id,
+                    pet_id,
+                    args.get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(50)
+                        .clamp(1, 100),
+                )
+                .await
+                .map_err(internal)?,
             )
             .map_err(internal)?
         }
@@ -831,6 +858,88 @@ async fn call_tool(
             .map_err(internal)?;
             json!({"weight_id":id,"message":"Weight saved."})
         }
+        "record_symptom_event" => {
+            let pet_id = integer(&args, "pet_id")?;
+            let pet = db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .ok_or((-32602, "That pet is not in this household.".into()))?;
+            let message = string(&args, "message")?;
+            let symptom = args
+                .get("symptom")
+                .and_then(Value::as_str)
+                .unwrap_or("vomiting");
+            if !matches!(symptom, "vomiting" | "diarrhea" | "reduced_appetite") {
+                return Err((-32602, "symptom is not supported.".into()));
+            }
+            let minutes_ago = args
+                .get("minutes_ago")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, 525_600);
+            let event_id = db::create_symptom_event(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pet,
+                &message,
+                Utc::now() - Duration::minutes(minutes_ago),
+                symptom,
+                args.get("occurrence_count")
+                    .and_then(Value::as_i64)
+                    .filter(|value| (1..=100).contains(value)),
+                string_opt(&args, "amount"),
+                string_opt(&args, "contents"),
+                string_opt(&args, "meal_relation"),
+                string_opt(&args, "water_status"),
+                string_opt(&args, "appetite_status"),
+                string_opt(&args, "energy_status"),
+                string_opt(&args, "pain_status"),
+                string_opt(&args, "note"),
+                "mcp",
+            )
+            .await
+            .map_err(internal)?;
+            json!({"event_id":event_id,"pet":pet.name,"message":"Structured symptom event recorded. The original wording is preserved."})
+        }
+        "record_medication" => {
+            let pet_id = integer(&args, "pet_id")?;
+            let pet = db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .ok_or((-32602, "That pet is not in this household.".into()))?;
+            let name = string(&args, "name")?;
+            let status = args
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("given");
+            if !matches!(status, "given" | "missed" | "extra" | "vomited_back") {
+                return Err((-32602, "status is not supported.".into()));
+            }
+            let minutes_ago = args
+                .get("minutes_ago")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, 525_600);
+            let medication_id = db::create_medication_administration(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pet,
+                &name,
+                string_opt(&args, "active_ingredient"),
+                args.get("dose_value").and_then(Value::as_f64),
+                string_opt(&args, "dose_unit"),
+                string_opt(&args, "route"),
+                Utc::now() - Duration::minutes(minutes_ago),
+                None,
+                status,
+                string_opt(&args, "message"),
+            )
+            .await
+            .map_err(internal)?;
+            json!({"medication_id":medication_id,"pet":pet.name,"message":"Medication exposure recorded."})
+        }
         "upload_blood_test" => {
             let filename = string(&args, "filename")?;
             let content = string(&args, "content_base64")?;
@@ -920,6 +1029,12 @@ fn string(args: &Value, key: &str) -> Result<String, (i32, String)> {
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
         .ok_or((-32602, format!("{key} is required.")))
+}
+fn string_opt<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 fn internal(error: impl std::fmt::Display) -> (i32, String) {
     (-32603, error.to_string())

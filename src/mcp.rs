@@ -51,7 +51,12 @@ pub async fn endpoint(
         ).into_response();
     }
     let response = match authenticate(&state, &headers).await {
-        Ok(user) => handle(&state, &user, request).await,
+        Ok(user) => {
+            if request.id.is_none() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            handle(&state, &user, request).await
+        }
         Err((status, message)) => {
             return (
                 status,

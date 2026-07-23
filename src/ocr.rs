@@ -206,6 +206,49 @@ fn find_date(text: &str) -> Option<String> {
 
 pub fn parse_results(text: &str) -> Vec<ParsedLabResult> {
     let mut output = Vec::new();
+    let test_name = Regex::new(r"(?im)^(?:test|prueba)\s*:\s*(.+)$")
+        .unwrap()
+        .captures_iter(
+            text.lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .as_str(),
+        )
+        .last()
+        .and_then(|capture| capture.get(1).map(|value| value.as_str().trim().to_owned()))
+        .unwrap_or_else(|| "Blood test result".into());
+    if let Some(capture) = Regex::new(r"(?im)^(?:result|resultado)\s*:\s*(.+)$")
+        .unwrap()
+        .captures_iter(
+            text.lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .as_str(),
+        )
+        .next()
+    {
+        let labeled_value = capture[1].trim();
+        let number = Regex::new(r"[-+]?\d+(?:[.,]\d+)?")
+            .unwrap()
+            .find(labeled_value);
+        let value_text = number
+            .map(|number| number.as_str().to_owned())
+            .unwrap_or_else(|| labeled_value.to_owned());
+        let unit = number.and_then(|number| {
+            let unit = labeled_value[number.end()..].trim();
+            (!unit.is_empty()).then(|| unit.to_owned())
+        });
+        output.push(ParsedLabResult {
+            test_name,
+            value_numeric: parse_number(&value_text),
+            value_text,
+            unit,
+            reference_range: None,
+            flag: None,
+        });
+    }
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let cells: Vec<_> = line
             .trim_matches('|')
@@ -285,5 +328,14 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].test_name, "Hemoglobina");
         assert_eq!(results[0].value_numeric, Some(14.2));
+    }
+
+    #[test]
+    fn parses_labeled_single_result() {
+        let results = parse_results("Test : T4\nResult : 44.72 nmol/L\nDate : 2022-05-06");
+        assert_eq!(results[0].test_name, "T4");
+        assert_eq!(results[0].value_text, "44.72");
+        assert_eq!(results[0].value_numeric, Some(44.72));
+        assert_eq!(results[0].unit.as_deref(), Some("nmol/L"));
     }
 }

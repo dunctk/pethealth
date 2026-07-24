@@ -108,6 +108,7 @@ pub struct MedicationAdherence {
     pub prescription_id: i64,
     pub pet_id: i64,
     pub pet_name: String,
+    pub prescription_name: String,
     pub scheduled_for: String,
     pub expected_dose_value: Option<f64>,
     pub expected_dose_unit: Option<String>,

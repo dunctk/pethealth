@@ -175,4 +175,7 @@ input::placeholder { color: #586168; }
 .adherence-row { display: grid; grid-template-columns: 1fr auto; gap: .25rem .75rem; padding: .65rem 0; border-bottom: 1px solid var(--line); color: var(--soft); font: .63rem/1.3 var(--mono); }
 .adherence-row > div:first-child { display: flex; gap: .5rem; }
 .adherence-row > div:first-child span { color: #e7c878; text-transform: uppercase; }
+.adherence-row .adherence-status { color: #e7c878; text-transform: uppercase; }
+.adherence-row .adherence-status.partial { color: #e3a75b; }
+.adherence-row .adherence-status.missed { color: #d68d8d; }
 .adherence-row small { grid-column: 1 / -1; color: var(--muted); }

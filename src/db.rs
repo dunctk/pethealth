@@ -1404,8 +1404,9 @@ pub async fn list_adherence(
     let rows = db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            r#"SELECT a.*,p.name AS pet_name FROM medication_adherence a
-           JOIN pets p ON p.id=a.pet_id WHERE a.household_id=? AND a.pet_id=?
+            r#"SELECT a.*,p.name AS pet_name,m.name AS prescription_name FROM medication_adherence a
+           JOIN pets p ON p.id=a.pet_id JOIN medication_prescriptions m ON m.id=a.prescription_id
+           WHERE a.household_id=? AND a.pet_id=?
            ORDER BY a.scheduled_for DESC, a.id DESC LIMIT ?"#,
             [household_id.into(), pet_id.into(), limit.into()],
         ))
@@ -1822,6 +1823,7 @@ fn adherence_from_row(row: QueryResult) -> anyhow::Result<MedicationAdherence> {
         prescription_id: row.try_get("", "prescription_id")?,
         pet_id: row.try_get("", "pet_id")?,
         pet_name: row.try_get("", "pet_name")?,
+        prescription_name: row.try_get("", "prescription_name")?,
         scheduled_for: row.try_get("", "scheduled_for")?,
         expected_dose_value: row.try_get("", "expected_dose_value")?,
         expected_dose_unit: row.try_get("", "expected_dose_unit")?,

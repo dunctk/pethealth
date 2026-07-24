@@ -83,6 +83,49 @@ pub struct MedicationAdministration {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct MedicationPrescription {
+    pub id: i64,
+    pub pet_id: i64,
+    pub pet_name: String,
+    pub name: String,
+    pub active_ingredient: Option<String>,
+    pub concentration_value: Option<f64>,
+    pub concentration_unit: Option<String>,
+    pub dose_value: Option<f64>,
+    pub dose_unit: Option<String>,
+    pub frequency: Option<String>,
+    pub route: Option<String>,
+    pub instructions: Option<String>,
+    pub started_on: Option<String>,
+    pub ended_on: Option<String>,
+    pub status: String,
+    pub raw_input: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MedicationAdherence {
+    pub id: i64,
+    pub prescription_id: i64,
+    pub pet_id: i64,
+    pub pet_name: String,
+    pub scheduled_for: String,
+    pub expected_dose_value: Option<f64>,
+    pub expected_dose_unit: Option<String>,
+    pub actual_dose_value: Option<f64>,
+    pub actual_dose_unit: Option<String>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub raw_input: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MedicationPlan {
+    pub prescriptions: Vec<MedicationPrescription>,
+    pub adherence: Vec<MedicationAdherence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct TemporalLink {
     pub event_id: i64,
     pub medication_id: i64,
@@ -93,6 +136,8 @@ pub struct TemporalLink {
 pub struct ClinicalTimeline {
     pub events: Vec<HealthEvent>,
     pub medications: Vec<MedicationAdministration>,
+    pub prescriptions: Vec<MedicationPrescription>,
+    pub adherence: Vec<MedicationAdherence>,
     pub temporal_links: Vec<TemporalLink>,
 }
 

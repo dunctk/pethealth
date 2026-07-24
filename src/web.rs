@@ -1,8 +1,8 @@
 use crate::{
     AppState, auth, db,
     domain::{
-        HealthEvent, KnowledgeArticle, LabReport, MedicationAdministration, Pet, ShareGrant,
-        UserAccount, WeightEntry,
+        HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
+        MedicationPrescription, Pet, ShareGrant, UserAccount, WeightEntry,
     },
     ocr,
 };
@@ -27,6 +27,8 @@ pub fn router(state: AppState) -> Router {
         .route("/weights", post(create_weight))
         .route("/symptoms", post(create_symptom))
         .route("/medications", post(create_medication))
+        .route("/prescriptions", post(create_prescription))
+        .route("/medication-adherence", post(create_adherence))
         .route("/blood-tests/upload", post(upload_blood_test))
         .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
@@ -293,6 +295,14 @@ async fn index(
         Some(pet) => db::list_medications(&state.db, user.household_id, pet.id, 20).await?,
         None => Vec::new(),
     };
+    let prescriptions = match &selected_pet {
+        Some(pet) => db::list_prescriptions(&state.db, user.household_id, pet.id, 20).await?,
+        None => Vec::new(),
+    };
+    let adherence = match &selected_pet {
+        Some(pet) => db::list_adherence(&state.db, user.household_id, pet.id, 30).await?,
+        None => Vec::new(),
+    };
     let origin = request_origin(&state, &headers);
     render(&ConsoleTemplate {
         user,
@@ -305,6 +315,8 @@ async fn index(
         weights,
         lab_reports,
         medications,
+        prescriptions,
+        adherence,
         new_share_path: None,
         capture_message: None,
         capture_error: None,
@@ -496,6 +508,109 @@ async fn create_medication(
         None,
         status,
         clean_optional(form.note.as_deref(), 500),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
+}
+
+#[derive(Deserialize)]
+struct PrescriptionForm {
+    pet_id: i64,
+    name: String,
+    active_ingredient: Option<String>,
+    concentration_value: Option<f64>,
+    concentration_unit: Option<String>,
+    dose_value: Option<f64>,
+    dose_unit: Option<String>,
+    frequency: Option<String>,
+    route: Option<String>,
+    instructions: Option<String>,
+    started_on: Option<String>,
+    status: Option<String>,
+    raw_input: Option<String>,
+}
+
+async fn create_prescription(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<PrescriptionForm>,
+) -> Result<Redirect, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let name = clean_required(&form.name, 120, "Medication")?;
+    let status = clean_optional(form.status.as_deref(), 30).unwrap_or("active");
+    if !matches!(status, "active" | "paused" | "stopped") {
+        return Err(AppError::validation(
+            "Choose a supported prescription status.",
+        ));
+    }
+    db::create_medication_prescription(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        name,
+        clean_optional(form.active_ingredient.as_deref(), 120),
+        form.concentration_value,
+        clean_optional(form.concentration_unit.as_deref(), 40),
+        form.dose_value,
+        clean_optional(form.dose_unit.as_deref(), 30),
+        clean_optional(form.frequency.as_deref(), 80),
+        clean_optional(form.route.as_deref(), 40),
+        clean_optional(form.instructions.as_deref(), 500),
+        clean_optional(form.started_on.as_deref(), 20),
+        status,
+        clean_optional(form.raw_input.as_deref(), 1000),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
+}
+
+#[derive(Deserialize)]
+struct AdherenceForm {
+    pet_id: i64,
+    prescription_id: i64,
+    scheduled_for: String,
+    actual_dose_value: Option<f64>,
+    actual_dose_unit: Option<String>,
+    status: String,
+    reason: Option<String>,
+    raw_input: Option<String>,
+}
+
+async fn create_adherence(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<AdherenceForm>,
+) -> Result<Redirect, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let prescription =
+        db::get_prescription(&state.db, user.household_id, pet.id, form.prescription_id)
+            .await?
+            .ok_or_else(AppError::not_found)?;
+    let scheduled_for = clean_required(&form.scheduled_for, 20, "Date")?;
+    if chrono::NaiveDate::parse_from_str(scheduled_for, "%Y-%m-%d").is_err() {
+        return Err(AppError::validation("Use a valid date."));
+    }
+    let status = clean_required(&form.status, 30, "Status")?;
+    if !matches!(status, "given" | "partial" | "missed" | "unknown") {
+        return Err(AppError::validation("Choose a supported adherence status."));
+    }
+    db::create_medication_adherence(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        &prescription,
+        scheduled_for,
+        form.actual_dose_value,
+        clean_optional(form.actual_dose_unit.as_deref(), 30),
+        status,
+        clean_optional(form.reason.as_deref(), 500),
+        clean_optional(form.raw_input.as_deref(), 1000),
     )
     .await?;
     Ok(Redirect::to(&format!("/?pet={}", pet.id)))
@@ -948,6 +1063,8 @@ struct ConsoleTemplate {
     weights: Vec<WeightEntry>,
     lab_reports: Vec<LabReport>,
     medications: Vec<MedicationAdministration>,
+    prescriptions: Vec<MedicationPrescription>,
+    adherence: Vec<MedicationAdherence>,
     new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,

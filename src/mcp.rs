@@ -687,6 +687,7 @@ fn tool_list() -> Value {
         {"name":"list_pets","description":"List the pets in the signed-in household.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}},
         {"name":"get_pet_timeline","description":"Read active health events for one pet. The original wording is included.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_clinical_timeline","description":"Read a pet's symptoms, medications, and neutral time links between them. This is context for a vet, not a diagnosis.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
+        {"name":"get_medication_plan","description":"Read a pet's current prescriptions and dose-adherence history. This is a record, not a dosing recommendation.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_health_context","description":"Read practical care context for a health concept. This is not a diagnosis.","inputSchema":{"type":"object","properties":{"concept":{"type":"string"}},"required":["concept"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_weight_history","description":"Read weight measurements over time for one pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
         {"name":"get_blood_test_history","description":"Read imported blood-test values for one pet. Original reports remain stored for review.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"}},"required":["pet_id"]},"annotations":{"readOnlyHint":true}},
@@ -694,6 +695,8 @@ fn tool_list() -> Value {
         {"name":"record_weight","description":"Save a weight measurement for a pet.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"weight_kg":{"type":"number"},"measured_at":{"type":"string","description":"YYYY-MM-DD"},"note":{"type":"string"}},"required":["pet_id","weight_kg","measured_at"]}},
         {"name":"record_symptom_event","description":"Record a structured symptom using the user's original wording. The server timestamps it now or by relative minutes_ago; absolute timestamps are not accepted from the model.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"message":{"type":"string"},"symptom":{"type":"string","enum":["vomiting","diarrhea","reduced_appetite"]},"minutes_ago":{"type":"integer","minimum":0,"maximum":525600},"occurrence_count":{"type":"integer","minimum":1,"maximum":100},"amount":{"type":"string"},"contents":{"type":"string"},"meal_relation":{"type":"string"},"water_status":{"type":"string"},"appetite_status":{"type":"string"},"energy_status":{"type":"string"},"pain_status":{"type":"string"},"note":{"type":"string"}},"required":["pet_id","message","symptom"]}},
         {"name":"record_medication","description":"Record a medication exposure. The server timestamps administration now or by relative minutes_ago; include the exact product, active ingredient, strength, dose, route, and whether it was given, missed, extra, or vomited back.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"name":{"type":"string"},"active_ingredient":{"type":"string"},"dose_value":{"type":"number"},"dose_unit":{"type":"string"},"route":{"type":"string"},"minutes_ago":{"type":"integer","minimum":0,"maximum":525600},"status":{"type":"string","enum":["given","missed","extra","vomited_back"]},"message":{"type":"string"}},"required":["pet_id","name"]}},
+        {"name":"record_prescription","description":"Save a pet's current prescription plan, including strength, dose, frequency, and instructions. The original wording is preserved.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"name":{"type":"string"},"active_ingredient":{"type":"string"},"concentration_value":{"type":"number"},"concentration_unit":{"type":"string"},"dose_value":{"type":"number"},"dose_unit":{"type":"string"},"frequency":{"type":"string"},"route":{"type":"string"},"instructions":{"type":"string"},"started_days_ago":{"type":"integer","minimum":0,"maximum":36500},"status":{"type":"string","enum":["active","paused","stopped"]},"message":{"type":"string"}},"required":["pet_id","name"]}},
+        {"name":"record_medication_adherence","description":"Record whether a scheduled prescription dose was given, partial, missed, or unknown. Use days_ago for a past calendar day; the server chooses the date.","inputSchema":{"type":"object","properties":{"pet_id":{"type":"integer"},"prescription_id":{"type":"integer"},"days_ago":{"type":"integer","minimum":0,"maximum":36500},"actual_dose_value":{"type":"number"},"actual_dose_unit":{"type":"string"},"status":{"type":"string","enum":["given","partial","missed","unknown"]},"reason":{"type":"string"},"message":{"type":"string"}},"required":["pet_id","prescription_id","status"]}},
         {"name":"upload_blood_test","description":"Store one PDF or image in this household's private area and import it with Mistral OCR 4.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"},"content_base64":{"type":"string","description":"The PDF or image bytes encoded as base64."}},"required":["filename","content_base64"]}},
         {"name":"import_blood_tests","description":"OCR new PDF and image files from this household's private blood-test folder using Mistral OCR 4.","inputSchema":{"type":"object","properties":{} }},
         {"name":"record_health_event","description":"Record one observation from the user's wording. The server chooses the timestamp and preserves the original wording.","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
@@ -753,6 +756,30 @@ async fn call_tool(
             }
             serde_json::to_value(
                 db::clinical_timeline(
+                    &state.db,
+                    user.household_id,
+                    pet_id,
+                    args.get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(50)
+                        .clamp(1, 100),
+                )
+                .await
+                .map_err(internal)?,
+            )
+            .map_err(internal)?
+        }
+        "get_medication_plan" => {
+            let pet_id = integer(&args, "pet_id")?;
+            if db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err((-32602, "That pet is not in this household.".into()));
+            }
+            serde_json::to_value(
+                db::medication_plan(
                     &state.db,
                     user.household_id,
                     pet_id,
@@ -939,6 +966,90 @@ async fn call_tool(
             .await
             .map_err(internal)?;
             json!({"medication_id":medication_id,"pet":pet.name,"message":"Medication exposure recorded."})
+        }
+        "record_prescription" => {
+            let pet_id = integer(&args, "pet_id")?;
+            let pet = db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .ok_or((-32602, "That pet is not in this household.".into()))?;
+            let name = string(&args, "name")?;
+            let status = args
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("active");
+            if !matches!(status, "active" | "paused" | "stopped") {
+                return Err((-32602, "status is not supported.".into()));
+            }
+            let started_on = args
+                .get("started_days_ago")
+                .and_then(Value::as_i64)
+                .map(|days| {
+                    (Utc::now().date_naive() - Duration::days(days.clamp(0, 36_500))).to_string()
+                });
+            let prescription_id = db::create_medication_prescription(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pet,
+                &name,
+                string_opt(&args, "active_ingredient"),
+                args.get("concentration_value").and_then(Value::as_f64),
+                string_opt(&args, "concentration_unit"),
+                args.get("dose_value").and_then(Value::as_f64),
+                string_opt(&args, "dose_unit"),
+                string_opt(&args, "frequency"),
+                string_opt(&args, "route"),
+                string_opt(&args, "instructions"),
+                started_on.as_deref(),
+                status,
+                string_opt(&args, "message"),
+            )
+            .await
+            .map_err(internal)?;
+            json!({"prescription_id":prescription_id,"pet":pet.name,"message":"Prescription plan recorded. The original wording is preserved."})
+        }
+        "record_medication_adherence" => {
+            let pet_id = integer(&args, "pet_id")?;
+            let pet = db::get_pet(&state.db, user.household_id, pet_id)
+                .await
+                .map_err(internal)?
+                .ok_or((-32602, "That pet is not in this household.".into()))?;
+            let prescription_id = integer(&args, "prescription_id")?;
+            let prescription =
+                db::get_prescription(&state.db, user.household_id, pet.id, prescription_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or((
+                        -32602,
+                        "That prescription is not in this household for this pet.".into(),
+                    ))?;
+            let status = string(&args, "status")?;
+            if !matches!(status.as_str(), "given" | "partial" | "missed" | "unknown") {
+                return Err((-32602, "status is not supported.".into()));
+            }
+            let days_ago = args
+                .get("days_ago")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, 36_500);
+            let scheduled_for = (Utc::now().date_naive() - Duration::days(days_ago)).to_string();
+            let adherence_id = db::create_medication_adherence(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pet,
+                &prescription,
+                &scheduled_for,
+                args.get("actual_dose_value").and_then(Value::as_f64),
+                string_opt(&args, "actual_dose_unit"),
+                &status,
+                string_opt(&args, "reason"),
+                string_opt(&args, "message"),
+            )
+            .await
+            .map_err(internal)?;
+            json!({"adherence_id":adherence_id,"prescription_id":prescription.id,"pet":pet.name,"scheduled_for":scheduled_for,"message":"Medication adherence recorded."})
         }
         "upload_blood_test" => {
             let filename = string(&args, "filename")?;

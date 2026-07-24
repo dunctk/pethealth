@@ -1,9 +1,9 @@
 use crate::{
     auth,
     domain::{
-        ClinicalTimeline, DEFAULT_HOUSEHOLD_ID, HealthEvent, KnowledgeArticle,
-        MedicationAdministration, Pet, ProposedEvent, ShareGrant, SymptomObservation, TemporalLink,
-        UserAccount, event_presentation,
+        ClinicalTimeline, DEFAULT_HOUSEHOLD_ID, HealthEvent, KnowledgeArticle, MedicationAdherence,
+        MedicationAdministration, MedicationPlan, MedicationPrescription, Pet, ProposedEvent,
+        ShareGrant, SymptomObservation, TemporalLink, UserAccount, event_presentation,
     },
 };
 use anyhow::{Context, anyhow};
@@ -162,6 +162,50 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_meds_tenant_pet_time
             ON medication_administrations(household_id, pet_id, administered_at DESC);
+        CREATE TABLE IF NOT EXISTS medication_prescriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            active_ingredient TEXT,
+            concentration_value REAL,
+            concentration_unit TEXT,
+            dose_value REAL,
+            dose_unit TEXT,
+            frequency TEXT,
+            route TEXT,
+            instructions TEXT,
+            started_on TEXT,
+            ended_on TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            raw_input TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_prescriptions_tenant_pet_status
+            ON medication_prescriptions(household_id, pet_id, status, created_at DESC);
+        CREATE TABLE IF NOT EXISTS medication_adherence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            prescription_id INTEGER NOT NULL,
+            scheduled_for TEXT NOT NULL,
+            expected_dose_value REAL,
+            expected_dose_unit TEXT,
+            actual_dose_value REAL,
+            actual_dose_unit TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            raw_input TEXT,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id),
+            FOREIGN KEY (prescription_id) REFERENCES medication_prescriptions(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_adherence_tenant_pet_date
+            ON medication_adherence(household_id, pet_id, scheduled_for DESC);
         CREATE TABLE IF NOT EXISTS audit_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             household_id INTEGER NOT NULL,
@@ -1201,6 +1245,103 @@ pub async fn create_medication_administration(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn create_medication_prescription(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    name: &str,
+    active_ingredient: Option<&str>,
+    concentration_value: Option<f64>,
+    concentration_unit: Option<&str>,
+    dose_value: Option<f64>,
+    dose_unit: Option<&str>,
+    frequency: Option<&str>,
+    route: Option<&str>,
+    instructions: Option<&str>,
+    started_on: Option<&str>,
+    status: &str,
+    raw_input: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO medication_prescriptions
+               (household_id,pet_id,name,active_ingredient,concentration_value,concentration_unit,dose_value,dose_unit,frequency,route,instructions,started_on,status,raw_input,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+            [
+                household_id.into(), pet.id.into(), name.into(), active_ingredient.into(),
+                concentration_value.into(), concentration_unit.into(), dose_value.into(),
+                dose_unit.into(), frequency.into(), route.into(), instructions.into(),
+                started_on.into(), status.into(), raw_input.into(), now.clone().into(),
+                now.clone().into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow!("prescription insert returned no id"))?;
+    let id: i64 = row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "medication.prescription.created",
+        "medication_prescription",
+        id,
+        raw_input.unwrap_or(name),
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(id)
+}
+
+pub async fn create_medication_adherence(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    prescription: &MedicationPrescription,
+    scheduled_for: &str,
+    actual_dose_value: Option<f64>,
+    actual_dose_unit: Option<&str>,
+    status: &str,
+    reason: Option<&str>,
+    raw_input: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO medication_adherence
+               (household_id,pet_id,prescription_id,scheduled_for,expected_dose_value,expected_dose_unit,actual_dose_value,actual_dose_unit,status,reason,raw_input,recorded_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+            [
+                household_id.into(), pet.id.into(), prescription.id.into(), scheduled_for.into(),
+                prescription.dose_value.into(), prescription.dose_unit.clone().into(),
+                actual_dose_value.into(), actual_dose_unit.into(), status.into(), reason.into(),
+                raw_input.into(), now.clone().into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow!("adherence insert returned no id"))?;
+    let id: i64 = row.try_get("", "id")?;
+    audit(
+        db,
+        household_id,
+        actor,
+        "medication.adherence.recorded",
+        "medication_adherence",
+        id,
+        raw_input.unwrap_or(reason.unwrap_or("")),
+        &now,
+    )
+    .await?;
+    Ok(id)
+}
+
 pub async fn list_medications(
     db: &DatabaseConnection,
     household_id: i64,
@@ -1219,6 +1360,71 @@ pub async fn list_medications(
     rows.into_iter().map(medication_from_row).collect()
 }
 
+pub async fn list_prescriptions(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    limit: u64,
+) -> anyhow::Result<Vec<MedicationPrescription>> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT m.*,p.name AS pet_name FROM medication_prescriptions m
+           JOIN pets p ON p.id=m.pet_id WHERE m.household_id=? AND m.pet_id=?
+           ORDER BY CASE WHEN m.status='active' THEN 0 ELSE 1 END, m.created_at DESC LIMIT ?"#,
+            [household_id.into(), pet_id.into(), limit.into()],
+        ))
+        .await?;
+    rows.into_iter().map(prescription_from_row).collect()
+}
+
+pub async fn get_prescription(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    prescription_id: i64,
+) -> anyhow::Result<Option<MedicationPrescription>> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT m.*,p.name AS pet_name FROM medication_prescriptions m
+           JOIN pets p ON p.id=m.pet_id WHERE m.household_id=? AND m.pet_id=? AND m.id=?"#,
+            [household_id.into(), pet_id.into(), prescription_id.into()],
+        ))
+        .await?;
+    row.map(|value| prescription_from_row(value)).transpose()
+}
+
+pub async fn list_adherence(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    limit: u64,
+) -> anyhow::Result<Vec<MedicationAdherence>> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT a.*,p.name AS pet_name FROM medication_adherence a
+           JOIN pets p ON p.id=a.pet_id WHERE a.household_id=? AND a.pet_id=?
+           ORDER BY a.scheduled_for DESC, a.id DESC LIMIT ?"#,
+            [household_id.into(), pet_id.into(), limit.into()],
+        ))
+        .await?;
+    rows.into_iter().map(adherence_from_row).collect()
+}
+
+pub async fn medication_plan(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    limit: u64,
+) -> anyhow::Result<MedicationPlan> {
+    Ok(MedicationPlan {
+        prescriptions: list_prescriptions(db, household_id, pet_id, limit).await?,
+        adherence: list_adherence(db, household_id, pet_id, limit).await?,
+    })
+}
+
 pub async fn clinical_timeline(
     db: &DatabaseConnection,
     household_id: i64,
@@ -1227,6 +1433,7 @@ pub async fn clinical_timeline(
 ) -> anyhow::Result<ClinicalTimeline> {
     let events = list_events(db, household_id, Some(pet_id), limit).await?;
     let medications = list_medications(db, household_id, pet_id, limit).await?;
+    let plan = medication_plan(db, household_id, pet_id, limit).await?;
     let temporal_links = events
         .iter()
         .filter(|event| event.symptom.is_some())
@@ -1244,6 +1451,8 @@ pub async fn clinical_timeline(
     Ok(ClinicalTimeline {
         events,
         medications,
+        prescriptions: plan.prescriptions,
+        adherence: plan.adherence,
         temporal_links,
     })
 }
@@ -1584,6 +1793,47 @@ fn medication_from_row(row: QueryResult) -> anyhow::Result<MedicationAdministrat
     })
 }
 
+fn prescription_from_row(row: QueryResult) -> anyhow::Result<MedicationPrescription> {
+    Ok(MedicationPrescription {
+        id: row.try_get("", "id")?,
+        pet_id: row.try_get("", "pet_id")?,
+        pet_name: row.try_get("", "pet_name")?,
+        name: row.try_get("", "name")?,
+        active_ingredient: row.try_get("", "active_ingredient")?,
+        concentration_value: row.try_get("", "concentration_value")?,
+        concentration_unit: row.try_get("", "concentration_unit")?,
+        dose_value: row.try_get("", "dose_value")?,
+        dose_unit: row.try_get("", "dose_unit")?,
+        frequency: row.try_get("", "frequency")?,
+        route: row.try_get("", "route")?,
+        instructions: row.try_get("", "instructions")?,
+        started_on: row.try_get("", "started_on")?,
+        ended_on: row.try_get("", "ended_on")?,
+        status: row.try_get("", "status")?,
+        raw_input: row.try_get("", "raw_input")?,
+    })
+}
+
+fn adherence_from_row(row: QueryResult) -> anyhow::Result<MedicationAdherence> {
+    let recorded_at = DateTime::parse_from_rfc3339(&row.try_get::<String>("", "recorded_at")?)?
+        .with_timezone(&Utc);
+    Ok(MedicationAdherence {
+        id: row.try_get("", "id")?,
+        prescription_id: row.try_get("", "prescription_id")?,
+        pet_id: row.try_get("", "pet_id")?,
+        pet_name: row.try_get("", "pet_name")?,
+        scheduled_for: row.try_get("", "scheduled_for")?,
+        expected_dose_value: row.try_get("", "expected_dose_value")?,
+        expected_dose_unit: row.try_get("", "expected_dose_unit")?,
+        actual_dose_value: row.try_get("", "actual_dose_value")?,
+        actual_dose_unit: row.try_get("", "actual_dose_unit")?,
+        status: row.try_get("", "status")?,
+        reason: row.try_get("", "reason")?,
+        raw_input: row.try_get("", "raw_input")?,
+        recorded_at,
+    })
+}
+
 fn share_from_row(row: &QueryResult) -> anyhow::Result<ShareGrant> {
     let expires_at = DateTime::parse_from_rfc3339(&row.try_get::<String>("", "expires_at")?)?
         .with_timezone(&Utc);
@@ -1754,6 +2004,67 @@ mod tests {
                 .await
                 .unwrap()
                 .events
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn medication_plan_keeps_prescription_and_adherence_gaps_tenant_scoped() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        let prescription_id = create_medication_prescription(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "daily medicine",
+            None,
+            None,
+            None,
+            Some(2.5),
+            Some("mg"),
+            Some("once daily"),
+            Some("by mouth"),
+            Some("Split into two halves and give with treats"),
+            None,
+            "active",
+            Some("daily medicine 2.5mg per day; split into two halves and give with treats"),
+        )
+        .await
+        .unwrap();
+        let prescription = get_prescription(&db, 1, pet_id, prescription_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let adherence_id = create_medication_adherence(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            &prescription,
+            "2026-01-02",
+            Some(1.25),
+            Some("mg"),
+            "partial",
+            Some("Only half of the dose was eaten"),
+            Some("Over last 3 days she has only eaten half of the daily medicine dose"),
+        )
+        .await
+        .unwrap();
+        let plan = medication_plan(&db, 1, pet_id, 20).await.unwrap();
+        assert_eq!(plan.prescriptions[0].id, prescription_id);
+        assert_eq!(plan.prescriptions[0].dose_value, Some(2.5));
+        assert_eq!(plan.adherence[0].id, adherence_id);
+        assert_eq!(plan.adherence[0].status, "partial");
+        assert_eq!(plan.adherence[0].actual_dose_value, Some(1.25));
+        assert!(
+            medication_plan(&db, 2, pet_id, 20)
+                .await
+                .unwrap()
+                .prescriptions
                 .is_empty()
         );
     }

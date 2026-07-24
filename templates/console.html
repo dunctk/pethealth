@@ -121,6 +121,32 @@
         </form>
         {% if medications.is_empty() %}<p class="tracker-empty">No medication exposures recorded yet.</p>{% else %}<div class="medication-list">{% for medication in medications %}<div class="medication-row"><strong>{{ medication.name }}</strong><span>{{ medication.administered_at.format("%d %b, %H:%M") }}{% match medication.dose_value %}{% when Some with (dose) %}<small>{{ dose }}{% match medication.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>{% endif %}
       </section>
+      <section class="tracker-box prescription-box">
+        <div class="side-label">CURRENT PRESCRIPTIONS</div>
+        <h2>Medication plan</h2>
+        <p>Keep the prescribed plan separate from what was actually taken. Record gaps as missed or partial doses so an agent or vet can see the difference.</p>
+        <form method="post" action="/prescriptions" class="tracker-form">
+          <input type="hidden" name="pet_id" value="{{ pet.id }}">
+          <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="daily medicine"></label>
+          <label>Active ingredient <span class="field-hint">optional</span><input maxlength="120" name="active_ingredient" placeholder="benazepril"></label>
+          <label>Strength / concentration <span class="field-hint">optional</span><input type="number" min="0" step="0.001" name="concentration_value" placeholder="20"></label>
+          <label>Strength unit<input maxlength="40" name="concentration_unit" placeholder="mg/ml"></label>
+          <label>Dose per time<input type="number" min="0" step="0.001" name="dose_value" placeholder="2.5"></label>
+          <label>Dose unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
+          <label>Frequency<input maxlength="80" name="frequency" placeholder="once daily"></label>
+          <label>Route<input maxlength="40" name="route" placeholder="by mouth"></label>
+          <label>Started <span class="field-hint">optional</span><input type="date" name="started_on"></label>
+          <label>Status<select name="status"><option value="active">Active</option><option value="paused">Paused</option><option value="stopped">Stopped</option></select></label>
+          <label class="full-width">Instructions / original wording<input maxlength="500" name="instructions" placeholder="Split into two halves and give with treats"></label>
+          <label class="full-width">Source note <span class="field-hint">optional</span><input maxlength="1000" name="raw_input" placeholder="What the vet or owner said"></label>
+          <button class="button secondary full-width" type="submit">Save prescription</button>
+        </form>
+        {% if prescriptions.is_empty() %}<p class="tracker-empty">No current prescriptions recorded yet.</p>{% else %}
+        <div class="prescription-list">{% for prescription in prescriptions %}<article class="prescription-row"><div><div class="prescription-title"><strong>{{ prescription.name }}</strong><span class="prescription-status {{ prescription.status }}">{{ prescription.status }}</span></div><p>{% match prescription.dose_value %}{% when Some with (dose) %}{{ dose }}{% match prescription.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}{% when None %}Dose not recorded{% endmatch %}{% match prescription.frequency %}{% when Some with (frequency) %} · {{ frequency }}{% when None %}{% endmatch %}</p>{% match prescription.instructions %}{% when Some with (instructions) %}<small>{{ instructions }}</small>{% when None %}{% endmatch %}</div></article>{% endfor %}</div>
+        <div class="adherence-capture"><div class="side-label">DOSE GAPS</div><h3>Record what happened</h3><form method="post" action="/medication-adherence" class="tracker-form"><input type="hidden" name="pet_id" value="{{ pet.id }}"><label>Prescription<select required name="prescription_id">{% for prescription in prescriptions %}<option value="{{ prescription.id }}">{{ prescription.name }}</option>{% endfor %}</select></label><label>Date<input required type="date" name="scheduled_for"></label><label>Status<select required name="status"><option value="partial">Partial dose</option><option value="missed">Missed / not eaten</option><option value="given">Taken as prescribed</option><option value="unknown">Not sure</option></select></label><label>Actual dose <span class="field-hint">optional</span><input type="number" min="0" step="0.001" name="actual_dose_value" placeholder="1.25"></label><label>Unit <span class="field-hint">optional</span><input maxlength="30" name="actual_dose_unit" placeholder="mg"></label><label class="full-width">Why / note <span class="field-hint">optional</span><input maxlength="500" name="reason" placeholder="Only one of the two halves was eaten"></label><label class="full-width">Original wording <span class="field-hint">optional</span><input maxlength="1000" name="raw_input" placeholder="Milo only ate half of the daily medicine dose"></label><button class="button secondary full-width" type="submit">Save dose status</button></form></div>
+        {% if adherence.is_empty() %}<p class="tracker-empty">No dose gaps recorded yet.</p>{% else %}<div class="adherence-list">{% for dose in adherence %}<div class="adherence-row"><div><strong>{{ dose.scheduled_for }}</strong><span>{{ dose.status }}</span></div><div>{% match dose.actual_dose_value %}{% when Some with (actual) %}{{ actual }}{% match dose.actual_dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}{% when None %}—{% endmatch %}</div>{% match dose.reason %}{% when Some with (reason) %}<small>{{ reason }}</small>{% when None %}{% endmatch %}</div>{% endfor %}</div>{% endif %}
+        {% endif %}
+      </section>
       <section class="tracker-box lab-box">
         <div class="side-label">BLOOD TESTS</div>
         <h2>Bring in a lab report</h2>

@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn structures_velcro_vomiting_without_a_model() {
+    async fn structures_milo_vomiting_without_a_model() {
         let agent = CaptureAgent { llm: None };
         let result = agent
             .propose("Milo vomited just now", &["Milo".into(), "Luna".into()])

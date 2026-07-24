@@ -5,3 +5,5 @@
 /*.sqlite-wal
 /data
 /example_blood_tests/
+/.playwright-cli/
+/output/

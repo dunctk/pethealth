@@ -1950,14 +1950,14 @@ mod tests {
             "user:1",
             &pet,
             "anti-nausea medicine",
-            Some("anti-nausea ingredient"),
+            None,
             Some(8.0),
             Some("mg"),
             Some("oral"),
             medication_at,
             None,
             "given",
-            Some("Gave anti-nausea medicine 30 minutes before vomiting"),
+            Some("Gave an anti-nausea medicine before vomiting"),
         )
         .await
         .unwrap();
@@ -1966,7 +1966,7 @@ mod tests {
             1,
             "user:1",
             &pet,
-            "Milo vomited again at earlier",
+            "Milo vomited again earlier",
             medication_at + Duration::minutes(30),
             "vomiting",
             Some(1),
@@ -1985,10 +1985,7 @@ mod tests {
 
         let timeline = clinical_timeline(&db, 1, pet_id, 20).await.unwrap();
         assert_eq!(timeline.events[0].id, event_id);
-        assert_eq!(
-            timeline.events[0].raw_input,
-            "Milo vomited again at earlier"
-        );
+        assert_eq!(timeline.events[0].raw_input, "Milo vomited again earlier");
         assert_eq!(
             timeline.events[0]
                 .symptom
@@ -2026,14 +2023,14 @@ mod tests {
             None,
             None,
             None,
-            Some(2.5),
+            Some(1.0),
             Some("mg"),
             Some("once daily"),
             Some("by mouth"),
             Some("Split into two halves and give with treats"),
             None,
             "active",
-            Some("daily medicine 2.5mg per day; split into two halves and give with treats"),
+            Some("Daily medicine; split into two halves and give with treats"),
         )
         .await
         .unwrap();
@@ -2048,20 +2045,20 @@ mod tests {
             &pet,
             &prescription,
             "2026-01-02",
-            Some(1.25),
+            Some(0.5),
             Some("mg"),
             "partial",
             Some("Only half of the dose was eaten"),
-            Some("Over last 3 days she has only eaten half of the daily medicine dose"),
+            Some("Over the last few days, only half of the dose was eaten"),
         )
         .await
         .unwrap();
         let plan = medication_plan(&db, 1, pet_id, 20).await.unwrap();
         assert_eq!(plan.prescriptions[0].id, prescription_id);
-        assert_eq!(plan.prescriptions[0].dose_value, Some(2.5));
+        assert_eq!(plan.prescriptions[0].dose_value, Some(1.0));
         assert_eq!(plan.adherence[0].id, adherence_id);
         assert_eq!(plan.adherence[0].status, "partial");
-        assert_eq!(plan.adherence[0].actual_dose_value, Some(1.25));
+        assert_eq!(plan.adherence[0].actual_dose_value, Some(0.5));
         assert!(
             medication_plan(&db, 2, pet_id, 20)
                 .await

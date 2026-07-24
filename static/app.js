@@ -69,10 +69,11 @@ function formatDate(value) {
 function initLabTrends(root) {
   if (!root || root.dataset.ready === "true") return;
   root.dataset.ready = "true";
-  const select = root.querySelector("[data-trend-select]");
   const chart = root.querySelector("[data-trend-chart]");
   const summary = root.querySelector("[data-trend-summary]");
+  const count = root.querySelector("[data-trend-count]");
   const table = root.querySelector("[data-trend-table]");
+  const expand = root.querySelector("[data-trend-expand]");
   const points = [...root.querySelectorAll("[data-lab-point]")];
   const groups = new Map();
 
@@ -91,31 +92,24 @@ function initLabTrends(root) {
   });
 
   const ordered = [...groups.values()].sort((left, right) => left.label.localeCompare(right.label));
-  ordered.forEach((group) => {
-    const option = document.createElement("option");
-    option.value = group.key;
-    option.textContent = group.unit ? `${group.label} · ${group.unit}` : group.label;
-    select.append(option);
-  });
+  const readingCount = ordered.reduce((total, group) => total + group.points.length, 0);
+  count.textContent = ordered.length ? `${ordered.length} markers` : "—";
   if (!ordered.length) {
-    select.disabled = true;
     chart.innerHTML = '<div class="chart-empty">No dated numeric results yet. The reports are still saved below.</div>';
     summary.textContent = "";
     return;
   }
 
-  const render = (key) => {
-    const group = groups.get(key) || ordered[0];
+  const renderSeries = (group, seriesIndex) => {
     const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
     const latest = series[series.length - 1];
     const previous = series[series.length - 2];
     const delta = previous ? latest.value - previous.value : null;
     const deltaText = delta === null ? "first reading" : `${delta >= 0 ? "+" : "−"}${formatNumber(Math.abs(delta))} since previous`;
-    summary.innerHTML = `<strong>${formatNumber(latest.value)}${group.unit ? ` ${escapeHtml(group.unit)}` : ""}</strong><span>latest · ${escapeHtml(formatDate(latest.date))} · ${escapeHtml(deltaText)}</span>`;
 
-    const width = 600;
-    const height = 190;
-    const pad = { top: 18, right: 14, bottom: 31, left: 42 };
+    const width = 720;
+    const height = 250;
+    const pad = { top: 28, right: 18, bottom: 38, left: 54 };
     const values = series.map((point) => point.value);
     let min = Math.min(...values);
     let max = Math.max(...values);
@@ -131,12 +125,25 @@ function initLabTrends(root) {
       return `<line class="chart-grid" x1="${pad.left}" y1="${yPosition}" x2="${width - pad.right}" y2="${yPosition}"/><text class="chart-axis" x="${pad.left - 7}" y="${yPosition + 3}" text-anchor="end">${escapeHtml(formatNumber(value))}</text>`;
     }).join("");
     const dates = series.length === 1 ? `<text class="chart-axis" x="${x(0)}" y="${height - 9}" text-anchor="middle">${escapeHtml(formatDate(series[0].date))}</text>` : `<text class="chart-axis" x="${x(0)}" y="${height - 9}" text-anchor="start">${escapeHtml(formatDate(series[0].date))}</text><text class="chart-axis" x="${x(series.length - 1)}" y="${height - 9}" text-anchor="end">${escapeHtml(formatDate(series[series.length - 1].date))}</text>`;
-    const dots = series.map((point, index) => `<circle class="chart-dot${point.flag ? " flagged" : ""}" cx="${x(index)}" cy="${y(point.value)}" r="4"><title>${escapeHtml(formatDate(point.date))}: ${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}</title></circle>`).join("");
-    chart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(group.label)} over time"><defs><linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#62c7ff" stop-opacity=".23"/><stop offset="1" stop-color="#62c7ff" stop-opacity="0"/></linearGradient></defs>${grid}${dates}<path class="chart-area" d="${area}"/><path class="chart-line" d="${line}"/>${dots}</svg>`;
-    table.innerHTML = [...series].reverse().map((point) => `<tr><td>${escapeHtml(formatDate(point.date))}</td><td>${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}${point.flag ? ` <b>${escapeHtml(point.flag)}</b>` : ""}</td><td>${escapeHtml(point.reference)}</td></tr>`).join("");
+    const dots = series.map((point, index) => `<circle class="chart-dot${point.flag ? " flagged" : ""}" cx="${x(index)}" cy="${y(point.value)}" r="5"><title>${escapeHtml(formatDate(point.date))}: ${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}</title></circle>`).join("");
+    return `<article class="trend-card"><header class="trend-card-head"><div><span class="trend-card-label">${escapeHtml(group.unit || "RESULT")}</span><h4>${escapeHtml(group.label)}</h4></div><div class="trend-card-latest"><strong>${formatNumber(latest.value)}${group.unit ? ` ${escapeHtml(group.unit)}` : ""}</strong><span>${escapeHtml(formatDate(latest.date))} · ${escapeHtml(deltaText)}</span></div></header><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(group.label)} over time"><defs><linearGradient id="trend-fill-${seriesIndex}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#62c7ff" stop-opacity=".23"/><stop offset="1" stop-color="#62c7ff" stop-opacity="0"/></linearGradient></defs>${grid}${dates}<path class="chart-area" d="${area}" fill="url(#trend-fill-${seriesIndex})"/><path class="chart-line" d="${line}"/>${dots}</svg><footer class="trend-card-foot"><span>${series.length} reading${series.length === 1 ? "" : "s"}</span><span>${pointFlagCount(series)} flagged</span></footer></article>`;
   };
-  select.addEventListener("change", () => render(select.value));
-  render(ordered[0].key);
+
+  const pointFlagCount = (series) => series.filter((point) => point.flag).length;
+  summary.innerHTML = `<strong>${readingCount}</strong><span>readings across ${ordered.length} markers</span>`;
+  chart.innerHTML = ordered.map(renderSeries).join("");
+  table.innerHTML = ordered.flatMap((group) => group.points.map((point) => ({ ...point, label: group.label }))).sort((left, right) => right.date.localeCompare(left.date)).map((point) => `<tr><td>${escapeHtml(point.label)}</td><td>${escapeHtml(formatDate(point.date))}</td><td>${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}${point.flag ? ` <b>${escapeHtml(point.flag)}</b>` : ""}</td><td>${escapeHtml(point.reference)}</td></tr>`).join("");
+
+  const setExpanded = (expanded) => {
+    root.classList.toggle("is-expanded", expanded);
+    expand.setAttribute("aria-expanded", String(expanded));
+    expand.textContent = expanded ? "Close full view" : "Open full view";
+    document.body.classList.toggle("trend-focus-open", expanded);
+  };
+  expand.addEventListener("click", () => setExpanded(!root.classList.contains("is-expanded")));
+  root.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && root.classList.contains("is-expanded")) setExpanded(false);
+  });
 }
 
 function initAllLabTrends() {

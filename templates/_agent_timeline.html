@@ -2,8 +2,8 @@
   <form class="agent-capture" hx-post="/agent/capture" hx-target="#agent-and-timeline" hx-swap="outerHTML" hx-indicator="#agent-thinking">
     {% match selected_pet %}{% when Some with (pet) %}<input type="hidden" name="selected_pet_id" value="{{ pet.id }}">{% when None %}{% endmatch %}
     <div class="agent-label"><span class="agent-orb">✦</span><span><b>Record an event</b><small>Write what happened in your own words</small></span><span id="agent-thinking" class="htmx-indicator">SAVING...</span></div>
-    <div class="capture-row"><label class="sr-only" for="message">Pet health observation</label><input id="message" name="message" required maxlength="1000" autocomplete="off" placeholder="Milo vomited just now"><button class="send-button" type="submit" aria-label="Record observation">↑</button></div>
-    <div class="capture-help"><span>Your words are saved with the event.</span><span>Try: “{{ selected_pet.as_ref().unwrap().name }} vomited twice 10 minutes ago”</span></div>
+    <div class="capture-row"><label class="sr-only" for="message">Pet health observation</label><input id="message" name="message" required maxlength="1000" autocomplete="off" placeholder="She ate reasonably, but no medication was given this morning"><button class="send-button" type="submit" aria-label="Record observation">↑</button></div>
+    <div class="capture-help"><span>Your words are saved with the event.</span><span>Try: “She ate reasonably, but no medication was given this morning”</span></div>
     {% match capture_message %}{% when Some with (message) %}<div class="capture-result success" role="status"><span>✓</span>{{ message }}</div>{% when None %}{% endmatch %}
     {% match capture_error %}{% when Some with (message) %}<div class="capture-result error" role="alert"><span>!</span>{{ message }}</div>{% when None %}{% endmatch %}
   </form>

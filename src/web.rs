@@ -690,11 +690,16 @@ async fn capture(
     let message = clean_required(&form.message, 1000, "Observation")?.to_owned();
     let pets = db::list_pets(&state.db, user.household_id).await?;
     let names: Vec<_> = pets.iter().map(|pet| pet.name.clone()).collect();
-    let proposal = match state.agent.propose(&message, &names).await {
+    let selected_pet =
+        selected_from(&state, user.household_id, &pets, form.selected_pet_id).await?;
+    let selected_pet_name = selected_pet.as_ref().map(|pet| pet.name.as_str());
+    let intent = match state
+        .agent
+        .propose_capture(&message, &names, selected_pet_name)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
-            let selected_pet =
-                selected_from(&state, user.household_id, &pets, form.selected_pet_id).await?;
             let events = db::list_events(
                 &state.db,
                 user.household_id,
@@ -713,28 +718,59 @@ async fn capture(
             );
         }
     };
-    let pet = db::find_pet_by_name(&state.db, user.household_id, &proposal.pet_name)
+    let pet = db::find_pet_by_name(&state.db, user.household_id, &intent.event.pet_name)
         .await?
         .ok_or_else(|| AppError::validation("That pet no longer exists."))?;
     let received_at = Utc::now();
-    let occurred_at = state.agent.occurred_at(&proposal, received_at);
+    let occurred_at = state.agent.occurred_at(&intent.event, received_at);
     db::create_health_event(
         &state.db,
         user.household_id,
         &user.audit_actor(),
         &pet,
-        &proposal,
+        &intent.event,
         &message,
         occurred_at,
         "owner_agent",
     )
     .await?;
+    let mut missed_prescriptions = 0;
+    if intent.missed_medication {
+        let scheduled_for = occurred_at.date_naive().to_string();
+        let prescriptions =
+            db::list_prescriptions(&state.db, user.household_id, pet.id, 100).await?;
+        for prescription in prescriptions.iter().filter(|item| item.status == "active") {
+            db::create_medication_adherence(
+                &state.db,
+                user.household_id,
+                &user.audit_actor(),
+                &pet,
+                prescription,
+                &scheduled_for,
+                None,
+                None,
+                "missed",
+                Some("No medication was given."),
+                Some(&message),
+            )
+            .await?;
+            missed_prescriptions += 1;
+        }
+    }
     let events = db::list_events(&state.db, user.household_id, Some(pet.id), 50).await?;
+    let capture_message = if missed_prescriptions > 0 {
+        format!(
+            "Saved: {} Recorded missed doses for {} active prescription(s).",
+            intent.event.summary, missed_prescriptions
+        )
+    } else {
+        format!("Saved: {}", intent.event.summary)
+    };
     render_status(
         &AgentTimelineTemplate {
             selected_pet: Some(pet),
             events,
-            capture_message: Some(format!("Saved: {}", proposal.summary)),
+            capture_message: Some(capture_message),
             capture_error: None,
         },
         StatusCode::OK,

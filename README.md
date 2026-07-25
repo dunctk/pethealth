@@ -79,6 +79,8 @@ LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_MODEL=openai/gpt-4.1-mini
 ```
 
+`LLM_API_KEY` is an OpenRouter API key by default. The production compose file passes these three settings through to the container. The capture box also uses the selected pet when a note says “she”, “he”, or “they” without repeating the pet's name. A note saying no medication was given and appetite was reasonable is saved as a care update and marks the pet's active prescriptions as missed for that date.
+
 The model proposes a typed event only. Rust resolves the pet, validates the proposal, chooses the timestamp, and performs the tenant-scoped transaction.
 
 ## Verification

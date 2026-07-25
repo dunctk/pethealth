@@ -9,6 +9,12 @@ pub struct CaptureAgent {
     llm: Option<LlmConfig>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CaptureIntent {
+    pub event: ProposedEvent,
+    pub missed_medication: bool,
+}
+
 #[derive(Clone)]
 struct LlmConfig {
     api_key: String,
@@ -46,8 +52,17 @@ impl CaptureAgent {
         input: &str,
         pet_names: &[String],
     ) -> Result<ProposedEvent, CaptureError> {
-        if let Some(proposal) = deterministic_proposal(input, pet_names)? {
-            return Ok(proposal);
+        Ok(self.propose_capture(input, pet_names, None).await?.event)
+    }
+
+    pub async fn propose_capture(
+        &self,
+        input: &str,
+        pet_names: &[String],
+        selected_pet: Option<&str>,
+    ) -> Result<CaptureIntent, CaptureError> {
+        if let Some(intent) = deterministic_proposal(input, pet_names, selected_pet)? {
+            return Ok(intent);
         }
         let Some(llm) = &self.llm else {
             return Err(CaptureError::Unsupported);
@@ -58,10 +73,11 @@ impl CaptureAgent {
             .build()
             .map_err(|_| CaptureError::Model)?;
         let prompt = format!(
-            "Extract one factual pet-health event. Known pets: {}. Use only a known pet name. \
+            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. \
              event_type must be one of observation, symptom, medication, measurement, vet_visit. \
-             concept is a short lowercase canonical phrase. Do not diagnose. minutes_ago is only for explicit relative time. Input: {}",
+             concept is a short lowercase canonical phrase. Preserve factual medication absence and appetite wording in details. Do not invent a medicine, dose, diagnosis, or timestamp. minutes_ago is only for explicit relative time. Input: {}",
             pet_names.join(", "),
+            selected_pet.unwrap_or("none"),
             input
         );
         let proposal = client
@@ -71,7 +87,10 @@ impl CaptureAgent {
             .await
             .map_err(|_| CaptureError::Model)?;
         validate_pet(&proposal.pet_name, pet_names)?;
-        Ok(proposal)
+        Ok(CaptureIntent {
+            event: proposal,
+            missed_medication: false,
+        })
     }
 
     pub fn occurred_at(
@@ -86,9 +105,25 @@ impl CaptureAgent {
 fn deterministic_proposal(
     input: &str,
     pet_names: &[String],
-) -> Result<Option<ProposedEvent>, CaptureError> {
-    let pet_name = resolve_pet(input, pet_names)?;
+    selected_pet: Option<&str>,
+) -> Result<Option<CaptureIntent>, CaptureError> {
+    let pet_name = resolve_pet(input, pet_names, selected_pet)?;
     let lower = input.to_lowercase();
+    if mentions_missed_medication(&lower) && mentions_reasonable_appetite(&lower) {
+        return Ok(Some(CaptureIntent {
+            event: ProposedEvent {
+                pet_name,
+                event_type: "observation".into(),
+                concept: "care_update".into(),
+                summary: "Medication not given; appetite reasonable".into(),
+                details: Some(
+                    "No medication was given this morning. A reasonable amount was eaten.".into(),
+                ),
+                minutes_ago: None,
+            },
+            missed_medication: true,
+        }));
+    }
     let (event_type, concept, summary) = if contains_any(
         &lower,
         &["vomit", "vomited", "puked", "threw up", "sick was"],
@@ -110,17 +145,24 @@ fn deterministic_proposal(
     };
     let minutes_ago = parse_minutes_ago(&lower);
     let details = occurrence_count(&lower).map(|count| format!("Reported count: {count}"));
-    Ok(Some(ProposedEvent {
-        pet_name,
-        event_type: event_type.into(),
-        concept: concept.into(),
-        summary: summary.into(),
-        details,
-        minutes_ago,
+    Ok(Some(CaptureIntent {
+        event: ProposedEvent {
+            pet_name,
+            event_type: event_type.into(),
+            concept: concept.into(),
+            summary: summary.into(),
+            details,
+            minutes_ago,
+        },
+        missed_medication: false,
     }))
 }
 
-fn resolve_pet(input: &str, pet_names: &[String]) -> Result<String, CaptureError> {
+fn resolve_pet(
+    input: &str,
+    pet_names: &[String],
+    selected_pet: Option<&str>,
+) -> Result<String, CaptureError> {
     let lower = input.to_lowercase();
     let matches: Vec<_> = pet_names
         .iter()
@@ -135,7 +177,14 @@ fn resolve_pet(input: &str, pet_names: &[String]) -> Result<String, CaptureError
         .collect();
     match matches.as_slice() {
         [name] => Ok(name.clone()),
-        [] => Err(CaptureError::PetMissing),
+        [] => selected_pet
+            .filter(|selected| {
+                pet_names
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(selected))
+            })
+            .map(str::to_owned)
+            .ok_or(CaptureError::PetMissing),
         _ => Err(CaptureError::PetAmbiguous),
     }
 }
@@ -178,6 +227,49 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn mentions_missed_medication(input: &str) -> bool {
+    let absence = contains_any(
+        input,
+        &[
+            "no medication",
+            "no medications",
+            "no medicine",
+            "no medicines",
+            "no drugs",
+            "without medication",
+            "haven't given",
+            "havent given",
+            "have not given",
+            "didn't give",
+            "didnt give",
+            "did not give",
+        ],
+    );
+    absence
+        && contains_any(
+            input,
+            &["med", "medicine", "medication", "drug", "pill", "tablet"],
+        )
+}
+
+fn mentions_reasonable_appetite(input: &str) -> bool {
+    contains_any(
+        input,
+        &[
+            "eaten a reasonable amount",
+            "ate a reasonable amount",
+            "eating a reasonable amount",
+            "eaten reasonably",
+            "ate reasonably",
+            "eating reasonably",
+            "eaten well",
+            "ate well",
+            "eating well",
+            "good appetite",
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +284,31 @@ mod tests {
         assert_eq!(result.pet_name, "Milo");
         assert_eq!(result.concept, "vomiting");
         assert_eq!(result.minutes_ago, Some(0));
+    }
+
+    #[tokio::test]
+    async fn uses_selected_pet_and_records_compound_care_update_without_a_model() {
+        let agent = CaptureAgent { llm: None };
+        let result = agent
+            .propose_capture(
+                "we havent given her any drugs this morning, but she has eaten a reasonable amount",
+                &["Milo".into()],
+                Some("Milo"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.event.pet_name, "Milo");
+        assert_eq!(result.event.concept, "care_update");
+        assert_eq!(result.event.event_type, "observation");
+        assert!(result.missed_medication);
+        assert!(
+            result
+                .event
+                .details
+                .as_deref()
+                .unwrap()
+                .contains("reasonable amount")
+        );
     }
 
     #[tokio::test]

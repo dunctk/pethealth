@@ -61,19 +61,267 @@ function formatNumber(value) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(value);
 }
 
+// Full precision (day included) — used for the detail header, dot tooltips,
+// and the results table. `formatAxisDate` below is the shorter per-tick label
+// used directly on the chart, since a chart with many readings needs to show
+// every point without the labels colliding.
 function formatDate(value) {
   const date = new Date(`${value}T12:00:00Z`);
-  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { month: "short", year: "numeric" }).format(date);
+  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(date);
+}
+
+function formatAxisDate(value, includeYear) {
+  const date = new Date(`${value}T12:00:00Z`);
+  if (Number.isNaN(date.getTime())) return value;
+  const options = includeYear ? { day: "numeric", month: "short", year: "numeric" } : { day: "numeric", month: "short" };
+  return new Intl.DateTimeFormat(undefined, options).format(date);
+}
+
+// Shared canvas 2D context used only to measure rendered text width so the
+// chart's left axis gutter (`pad.left`) grows only as much as the tick labels
+// actually need, and so date labels can be thinned by real collision instead
+// of a guessed character count.
+let measureCtx = null;
+function measureTextWidth(text, font) {
+  if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
+let cachedAxisFont = null;
+function axisFont() {
+  if (!cachedAxisFont) {
+    const mono = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "monospace";
+    cachedAxisFont = `9px ${mono}`;
+  }
+  return cachedAxisFont;
+}
+
+// Reference ranges are free-text from OCR (§5c/§6): "3.5 - 5.5", "(29,0-52,0)",
+// "< 1.4", "5.50 ­ 19.50" (a soft hyphen, seen in real uploads), plain
+// junk with no numbers at all, or Spanish text. This never throws — it either
+// returns a low/high pair (either end may be null for an open-ended bound
+// like "< 1.4") or null, and the caller skips the band on null. It does not
+// try to be locale-perfect: numbers are assumed non-negative (true for every
+// blood-marker unit this app renders), so a bare hyphen is read as a range
+// separator, not a minus sign — the alternative (treating "20-100" as
+// "20, -100") is worse.
+function parseReferenceRange(raw) {
+  if (!raw) return null;
+  const text = String(raw).trim();
+  if (!text || text === "—" || /^n\/?a$/i.test(text)) return null;
+  // Two or more three-digit grouping dots ("6.500.000") are ambiguous between
+  // thousands-grouping and decimals without locale metadata. Real uploads in
+  // this repo contain exactly this pattern (haematocrit/platelet counts) —
+  // rather than guess a magnitude, skip the band for that row entirely.
+  if (/\d\.\d{3}\.\d{3}/.test(text)) return null;
+  const normalized = text.replace(/(\d),(\d)/g, "$1.$2");
+  const numberPattern = /\d+(?:\.\d+)?/g;
+  const boundMatch = normalized.match(/(<=|>=|≤|≥|<|>)/);
+  if (boundMatch) {
+    const numbers = normalized.match(numberPattern);
+    if (!numbers || !numbers.length) return null;
+    const value = Number(numbers[0]);
+    if (!Number.isFinite(value)) return null;
+    return boundMatch[1].includes("<") ? { low: null, high: value } : { low: value, high: null };
+  }
+  const numbers = normalized.match(numberPattern);
+  if (!numbers || numbers.length < 2) return null;
+  let low = Number(numbers[0]);
+  let high = Number(numbers[1]);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) return null;
+  if (low > high) [low, high] = [high, low];
+  return { low, high };
+}
+
+// A reference range can legitimately shift between reports (different lab,
+// different assay). The most recent parseable one is the currently-relevant
+// one, so scan from the latest reading backwards and use the first that
+// parses — if the latest reading's range is junk, an earlier valid one is
+// still better than no band at all.
+function pickReferenceBand(seriesAscending) {
+  for (let index = seriesAscending.length - 1; index >= 0; index -= 1) {
+    const band = parseReferenceRange(seriesAscending[index].reference);
+    if (band) return band;
+  }
+  return null;
+}
+
+function pointFlagCount(series) {
+  return series.filter((point) => point.flag).length;
+}
+
+// §5d: render in pixel space. `width`/`height` are real CSS pixels supplied
+// by the caller (the container's measured size), set as SVG attributes
+// instead of a `viewBox` — so `font: 9px var(--mono)`, `stroke-width: 2.5`,
+// and `r="5"` dots stay literally that size at any container width, rather
+// than being stretched by the browser the way `viewBox` + `width:100%` would.
+function renderMainChart(group, width, height) {
+  const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
+  const latest = series[series.length - 1];
+
+  // §5c.1: x is proportional to elapsed time, not reading index — three tests
+  // in a week and one a year later now sit close together and far apart,
+  // respectively, instead of evenly spaced. A single reading (or several on
+  // the same calendar day) has no time axis to be proportional to, so it
+  // falls back to centering (one point) or even spacing (same-day cluster).
+  const times = series.map((point) => Date.parse(`${point.date}T12:00:00Z`));
+  const validTimes = times.filter((t) => Number.isFinite(t));
+  const minT = validTimes.length ? Math.min(...validTimes) : 0;
+  const maxT = validTimes.length ? Math.max(...validTimes) : 0;
+  const timeRange = maxT - minT;
+
+  const band = pickReferenceBand(series);
+  const values = series.map((point) => point.value);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (band) {
+    if (band.low !== null) min = Math.min(min, band.low);
+    if (band.high !== null) max = Math.max(max, band.high);
+  }
+  if (min === max) {
+    const bump = Math.max(Math.abs(min) * .1, 1);
+    min -= bump;
+    max += bump;
+  }
+  const range = max - min;
+
+  // §5c.3: gridline count scales with the rendered height instead of a fixed
+  // three, so a near-fullscreen chart gets more of them.
+  const gridCount = Math.max(2, Math.min(8, Math.round((height - 60) / 55)));
+  const gridValues = Array.from({ length: gridCount + 1 }, (_, index) => max - (range * index) / gridCount);
+  const font = axisFont();
+  const gridLabelWidths = gridValues.map((value) => measureTextWidth(formatNumber(value), font));
+  const padLeft = Math.max(30, Math.ceil(Math.max(0, ...gridLabelWidths)) + 14);
+  const pad = { top: 20, right: 16, bottom: 34, left: padLeft };
+  const plotWidth = Math.max(1, width - pad.left - pad.right);
+  const plotHeight = Math.max(1, height - pad.top - pad.bottom);
+
+  const x = (index) => {
+    if (series.length === 1 || timeRange === 0 || !Number.isFinite(times[index])) {
+      return pad.left + (series.length === 1 ? plotWidth / 2 : (index * plotWidth) / (series.length - 1));
+    }
+    return pad.left + ((times[index] - minT) / timeRange) * plotWidth;
+  };
+  const y = (value) => pad.top + ((max - value) / range) * plotHeight;
+
+  const line = series.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ");
+  const area = `${line} L${x(series.length - 1).toFixed(1)},${(pad.top + plotHeight).toFixed(1)} L${x(0).toFixed(1)},${(pad.top + plotHeight).toFixed(1)} Z`;
+
+  // §5c.2: the reference range as a shaded band, when it parses. An
+  // open-ended bound (only `low` or only `high`) shades to the edge of the
+  // plotted area in that direction rather than guessing the missing edge.
+  let bandRect = "";
+  if (band) {
+    const yTop = band.high !== null ? y(Math.min(band.high, max)) : pad.top;
+    const yBottom = band.low !== null ? y(Math.max(band.low, min)) : pad.top + plotHeight;
+    if (yBottom > yTop) {
+      bandRect = `<rect class="chart-band" x="${pad.left}" y="${yTop.toFixed(1)}" width="${plotWidth.toFixed(1)}" height="${(yBottom - yTop).toFixed(1)}"/>`;
+    }
+  }
+
+  const grid = gridValues.map((value) => {
+    const yPosition = y(value);
+    return `<line class="chart-grid" x1="${pad.left}" y1="${yPosition.toFixed(1)}" x2="${width - pad.right}" y2="${yPosition.toFixed(1)}"/><text class="chart-axis" x="${pad.left - 7}" y="${(yPosition + 3).toFixed(1)}" text-anchor="end">${escapeHtml(formatNumber(value))}</text>`;
+  }).join("");
+
+  // §5c.4: every point gets a date label; labels are thinned only when they
+  // would actually collide (measured, not guessed), and the first/last are
+  // always kept as anchors.
+  const spansMultipleYears = new Set(series.map((point) => point.date.slice(0, 4))).size > 1;
+  const dateLabels = series.map((point) => formatAxisDate(point.date, spansMultipleYears));
+  const dateWidths = dateLabels.map((label) => measureTextWidth(label, font));
+  const xs = series.map((_, index) => x(index));
+  const shown = new Array(series.length).fill(false);
+  if (series.length) {
+    shown[0] = true;
+    shown[series.length - 1] = true;
+    const minGap = 8;
+    let lastRight = xs[0] + dateWidths[0] / 2;
+    const finalLeft = xs[series.length - 1] - dateWidths[series.length - 1] / 2;
+    for (let index = 1; index < series.length - 1; index += 1) {
+      const left = xs[index] - dateWidths[index] / 2;
+      const right = xs[index] + dateWidths[index] / 2;
+      if (left > lastRight + minGap && right + minGap < finalLeft) {
+        shown[index] = true;
+        lastRight = right;
+      }
+    }
+  }
+  const dateAxis = series.map((point, index) => {
+    if (!shown[index]) return "";
+    const anchor = index === 0 ? "start" : index === series.length - 1 ? "end" : "middle";
+    const labelX = anchor === "start" ? pad.left : anchor === "end" ? width - pad.right : xs[index];
+    return `<text class="chart-axis" x="${labelX.toFixed(1)}" y="${height - 9}" text-anchor="${anchor}">${escapeHtml(dateLabels[index])}</text>`;
+  }).join("");
+
+  // §5c.5: flagged points get an inline label (the flag text itself, e.g.
+  // "H"/"ALTO"), not just a recolored dot. Placed above the dot normally, but
+  // below it when the dot sits close to the top edge so the label does not
+  // clip.
+  const dots = series.map((point, index) => {
+    const cx = xs[index];
+    const cy = y(point.value);
+    const dot = `<circle class="chart-dot${point.flag ? " flagged" : ""}" cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="5"><title>${escapeHtml(formatDate(point.date))}: ${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}</title></circle>`;
+    if (!point.flag) return dot;
+    const above = cy - pad.top > 18;
+    const labelY = above ? cy - 10 : cy + 16;
+    return `${dot}<text class="chart-flag" x="${cx.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle">${escapeHtml(point.flag)}</text>`;
+  }).join("");
+
+  return `<svg width="${width}" height="${height}" role="img" aria-label="${escapeHtml(group.label)} over time"><defs><linearGradient id="trend-fill-${escapeHtml(group.key)}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#62c7ff" stop-opacity=".23"/><stop offset="1" stop-color="#62c7ff" stop-opacity="0"/></linearGradient></defs>${bandRect}${grid}${dateAxis}<path class="chart-area" d="${area}" fill="url(#trend-fill-${escapeHtml(group.key)})"/><path class="chart-line" d="${line}"/>${dots}</svg>`;
+}
+
+function renderDetailHead(group) {
+  const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
+  const latest = series[series.length - 1];
+  const previous = series[series.length - 2];
+  const delta = previous ? latest.value - previous.value : null;
+  const deltaText = delta === null ? "first reading" : `${delta >= 0 ? "+" : "−"}${formatNumber(Math.abs(delta))} since previous`;
+  return `<div><span class="trend-card-label">${escapeHtml(group.unit || "RESULT")}</span><h4>${escapeHtml(group.label)}</h4></div><div class="trend-card-latest"><strong>${escapeHtml(formatNumber(latest.value))}${group.unit ? ` ${escapeHtml(group.unit)}` : ""}</strong><span>${escapeHtml(formatDate(latest.date))} · ${escapeHtml(deltaText)}</span></div><div class="trend-detail-foot"><span>${series.length} reading${series.length === 1 ? "" : "s"}</span><span>${pointFlagCount(series)} flagged</span></div>`;
+}
+
+// A small, axis-free line for the filmstrip — still pixel-space (explicit
+// width/height, no viewBox) for the same reason as the main chart, just at a
+// size where axes and gridlines would only be noise.
+function renderSparkline(group, width, height) {
+  const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
+  const times = series.map((point) => Date.parse(`${point.date}T12:00:00Z`));
+  const validTimes = times.filter((t) => Number.isFinite(t));
+  const minT = validTimes.length ? Math.min(...validTimes) : 0;
+  const maxT = validTimes.length ? Math.max(...validTimes) : 0;
+  const timeRange = maxT - minT;
+  const values = series.map((point) => point.value);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) { const bump = Math.max(Math.abs(min) * .1, 1); min -= bump; max += bump; }
+  const range = max - min;
+  const padY = 4;
+  const x = (index) => (series.length === 1 || timeRange === 0 || !Number.isFinite(times[index]))
+    ? (series.length === 1 ? width / 2 : 2 + (index * (width - 4)) / (series.length - 1))
+    : 2 + ((times[index] - minT) / timeRange) * (width - 4);
+  const y = (value) => padY + ((max - value) / range) * (height - padY * 2);
+  const line = series.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ");
+  const latest = series[series.length - 1];
+  const anyFlagged = series.some((point) => point.flag);
+  return `<svg width="${width}" height="${height}" aria-hidden="true"><path class="spark-line${anyFlagged ? " flagged" : ""}" d="${line}"/><circle class="spark-dot" cx="${x(series.length - 1).toFixed(1)}" cy="${y(latest.value).toFixed(1)}" r="2.4"/></svg>`;
 }
 
 function initLabTrends(root) {
   if (!root || root.dataset.ready === "true") return;
   root.dataset.ready = "true";
   const chart = root.querySelector("[data-trend-chart]");
+  const detailHead = root.querySelector("[data-trend-detail-head]");
+  const detailInner = root.querySelector("[data-trend-movable]");
+  const detailHome = root.querySelector("[data-trend-detail-home]");
+  const filmstrip = root.querySelector("[data-trend-filmstrip]");
   const summary = root.querySelector("[data-trend-summary]");
   const count = root.querySelector("[data-trend-count]");
   const table = root.querySelector("[data-trend-table]");
   const expand = root.querySelector("[data-trend-expand]");
+  const dialog = root.querySelector("[data-trend-dialog]");
+  const dialogSlot = root.querySelector("[data-trend-dialog-slot]");
+  const dialogClose = root.querySelector("[data-trend-dialog-close]");
   const points = [...root.querySelectorAll("[data-lab-point]")];
   const groups = new Map();
 
@@ -97,53 +345,109 @@ function initLabTrends(root) {
   if (!ordered.length) {
     chart.innerHTML = '<div class="chart-empty">No dated numeric results yet. The reports are still saved below.</div>';
     summary.textContent = "";
+    detailHead.innerHTML = "";
+    filmstrip.innerHTML = "";
     return;
   }
 
-  const renderSeries = (group, seriesIndex) => {
-    const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
-    const latest = series[series.length - 1];
-    const previous = series[series.length - 2];
-    const delta = previous ? latest.value - previous.value : null;
-    const deltaText = delta === null ? "first reading" : `${delta >= 0 ? "+" : "−"}${formatNumber(Math.abs(delta))} since previous`;
-
-    const width = 720;
-    const height = 250;
-    const pad = { top: 28, right: 18, bottom: 38, left: 54 };
-    const values = series.map((point) => point.value);
-    let min = Math.min(...values);
-    let max = Math.max(...values);
-    if (min === max) { min -= Math.max(Math.abs(min) * .1, 1); max += Math.max(Math.abs(max) * .1, 1); }
-    const range = max - min;
-    const x = (index) => pad.left + (series.length === 1 ? (width - pad.left - pad.right) / 2 : index * (width - pad.left - pad.right) / (series.length - 1));
-    const y = (value) => pad.top + (max - value) * (height - pad.top - pad.bottom) / range;
-    const line = series.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ");
-    const area = `${line} L${x(series.length - 1).toFixed(1)},${height - pad.bottom} L${x(0).toFixed(1)},${height - pad.bottom} Z`;
-    const grid = [0, .5, 1].map((step) => {
-      const value = max - range * step;
-      const yPosition = pad.top + (height - pad.top - pad.bottom) * step;
-      return `<line class="chart-grid" x1="${pad.left}" y1="${yPosition}" x2="${width - pad.right}" y2="${yPosition}"/><text class="chart-axis" x="${pad.left - 7}" y="${yPosition + 3}" text-anchor="end">${escapeHtml(formatNumber(value))}</text>`;
-    }).join("");
-    const dates = series.length === 1 ? `<text class="chart-axis" x="${x(0)}" y="${height - 9}" text-anchor="middle">${escapeHtml(formatDate(series[0].date))}</text>` : `<text class="chart-axis" x="${x(0)}" y="${height - 9}" text-anchor="start">${escapeHtml(formatDate(series[0].date))}</text><text class="chart-axis" x="${x(series.length - 1)}" y="${height - 9}" text-anchor="end">${escapeHtml(formatDate(series[series.length - 1].date))}</text>`;
-    const dots = series.map((point, index) => `<circle class="chart-dot${point.flag ? " flagged" : ""}" cx="${x(index)}" cy="${y(point.value)}" r="5"><title>${escapeHtml(formatDate(point.date))}: ${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}</title></circle>`).join("");
-    return `<article class="trend-card"><header class="trend-card-head"><div><span class="trend-card-label">${escapeHtml(group.unit || "RESULT")}</span><h4>${escapeHtml(group.label)}</h4></div><div class="trend-card-latest"><strong>${formatNumber(latest.value)}${group.unit ? ` ${escapeHtml(group.unit)}` : ""}</strong><span>${escapeHtml(formatDate(latest.date))} · ${escapeHtml(deltaText)}</span></div></header><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(group.label)} over time"><defs><linearGradient id="trend-fill-${seriesIndex}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#62c7ff" stop-opacity=".23"/><stop offset="1" stop-color="#62c7ff" stop-opacity="0"/></linearGradient></defs>${grid}${dates}<path class="chart-area" d="${area}" fill="url(#trend-fill-${seriesIndex})"/><path class="chart-line" d="${line}"/>${dots}</svg><footer class="trend-card-foot"><span>${series.length} reading${series.length === 1 ? "" : "s"}</span><span>${pointFlagCount(series)} flagged</span></footer></article>`;
-  };
-
-  const pointFlagCount = (series) => series.filter((point) => point.flag).length;
   summary.innerHTML = `<strong>${readingCount}</strong><span>readings across ${ordered.length} markers</span>`;
-  chart.innerHTML = ordered.map(renderSeries).join("");
   table.innerHTML = ordered.flatMap((group) => group.points.map((point) => ({ ...point, label: group.label }))).sort((left, right) => right.date.localeCompare(left.date)).map((point) => `<tr><td>${escapeHtml(point.label)}</td><td>${escapeHtml(formatDate(point.date))}</td><td>${escapeHtml(formatNumber(point.value))}${point.unit ? ` ${escapeHtml(point.unit)}` : ""}${point.flag ? ` <b>${escapeHtml(point.flag)}</b>` : ""}</td><td>${escapeHtml(point.reference)}</td></tr>`).join("");
 
-  const setExpanded = (expanded) => {
-    root.classList.toggle("is-expanded", expanded);
-    expand.setAttribute("aria-expanded", String(expanded));
-    expand.textContent = expanded ? "Close full view" : "Open full view";
-    document.body.classList.toggle("trend-focus-open", expanded);
+  // §5b default selection: the marker with the most flagged readings — that
+  // history is the one most worth seeing large by default. `ordered` is
+  // already alphabetical, and this reduce keeps the first strictly-greater
+  // candidate, so ties fall back to alphabetical order. Falls back to the
+  // first marker alphabetically when nothing is flagged anywhere.
+  const flaggedTotals = ordered.map((group) => pointFlagCount(group.points));
+  let bestIndex = 0;
+  flaggedTotals.forEach((total, index) => { if (total > flaggedTotals[bestIndex]) bestIndex = index; });
+  let selectedKey = flaggedTotals[bestIndex] > 0 ? ordered[bestIndex].key : ordered[0].key;
+
+  const findGroup = (key) => ordered.find((group) => group.key === key) || ordered[0];
+
+  const renderFilmstrip = () => {
+    filmstrip.innerHTML = ordered.map((group) => {
+      const isActive = group.key === selectedKey;
+      const series = [...group.points].sort((left, right) => left.date.localeCompare(right.date));
+      const latest = series[series.length - 1];
+      const flaggedCount = pointFlagCount(series);
+      return `<button type="button" class="trend-spark${isActive ? " active" : ""}" data-marker-key="${escapeHtml(group.key)}" aria-pressed="${isActive}"><span class="trend-spark-label"><b>${escapeHtml(group.label)}</b>${flaggedCount ? `<i>${flaggedCount} flagged</i>` : ""}</span>${renderSparkline(group, 108, 34)}<span class="trend-spark-value">${escapeHtml(formatNumber(latest.value))}${group.unit ? ` <small>${escapeHtml(group.unit)}</small>` : ""}</span></button>`;
+    }).join("");
   };
-  expand.addEventListener("click", () => setExpanded(!root.classList.contains("is-expanded")));
-  root.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && root.classList.contains("is-expanded")) setExpanded(false);
+
+  // §5d: one renderer (`renderMainChart`), driven by a single ResizeObserver
+  // on `chart`. The same node is reparented into the dialog on open and back
+  // on close (see below), so this one observer and this one draw() serve
+  // both the inline size and the fullscreen dialog — nothing is rendered
+  // twice, and there is only ever one observer per `.lab-trends` instance.
+  const draw = () => {
+    const group = findGroup(selectedKey);
+    detailHead.innerHTML = renderDetailHead(group);
+    const box = chart.getBoundingClientRect();
+    const width = Math.max(200, Math.round(box.width || 0));
+    const height = Math.max(140, Math.round(Math.min(box.height || 0, window.innerHeight * .6) || 260));
+    chart.innerHTML = renderMainChart(group, width, height);
+  };
+
+  let frame = null;
+  const scheduleDraw = () => {
+    if (frame !== null) return;
+    frame = requestAnimationFrame(() => { frame = null; draw(); });
+  };
+
+  const observer = new ResizeObserver(scheduleDraw);
+  observer.observe(chart);
+  // Kept on the element itself so `htmx:beforeCleanupElement` (fired for
+  // every element in a subtree just before htmx removes it — see the
+  // document-level listener below) can find and disconnect it. `hx-swap`
+  // replaces `#tab-body`'s innerHTML on every tab switch, so without this a
+  // fresh `.lab-trends` node (and a fresh observer) is created each time the
+  // Labs tab is revisited, while the previous one — still holding a strong
+  // reference to its now-detached `chart` node — leaks.
+  root._trendResizeObserver = observer;
+
+  const selectMarker = (key) => {
+    if (key === selectedKey) return;
+    selectedKey = key;
+    renderFilmstrip();
+    draw();
+  };
+
+  filmstrip.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-marker-key]");
+    if (!button || !filmstrip.contains(button)) return;
+    selectMarker(button.dataset.markerKey);
   });
+
+  renderFilmstrip();
+  draw();
+
+  // §5a: replace the hand-rolled `.is-expanded` overlay with a native
+  // <dialog>. It brings Escape handling, focus trapping and inertness for
+  // free, so there is no manual keydown listener and no body class here.
+  const detailAnchor = document.createComment("trend-detail-anchor");
+  detailHome.insertBefore(detailAnchor, detailInner);
+  let previouslyFocused = null;
+
+  const openDialog = () => {
+    previouslyFocused = document.activeElement;
+    dialogSlot.appendChild(detailInner);
+    dialog.showModal();
+    scheduleDraw();
+  };
+  const closeDialog = () => {
+    detailAnchor.parentNode.insertBefore(detailInner, detailAnchor);
+    scheduleDraw();
+    if (previouslyFocused && document.contains(previouslyFocused) && typeof previouslyFocused.focus === "function") {
+      previouslyFocused.focus();
+    }
+  };
+
+  expand.addEventListener("click", openDialog);
+  dialogClose.addEventListener("click", () => dialog.close());
+  // Fires for Escape, the close button, and any other path that closes the
+  // dialog — one place to move the chart node back home and restore focus.
+  dialog.addEventListener("close", closeDialog);
 }
 
 function initAllLabTrends() {
@@ -152,6 +456,24 @@ function initAllLabTrends() {
 
 document.addEventListener("DOMContentLoaded", initAllLabTrends);
 document.addEventListener("htmx:afterSwap", initAllLabTrends);
+
+// See the comment on `root._trendResizeObserver` above: htmx fires this event
+// for every element in a subtree right before removing it (a tab switch swaps
+// `#tab-body`'s innerHTML), which is the one reliable moment to disconnect an
+// observer bound to a node that is about to become unreachable.
+document.addEventListener("htmx:beforeCleanupElement", (event) => {
+  const target = event.target;
+  if (!target || typeof target.matches !== "function") return;
+  const roots = target.matches("[data-lab-trends]")
+    ? [target]
+    : [...(target.querySelectorAll ? target.querySelectorAll("[data-lab-trends]") : [])];
+  roots.forEach((root) => {
+    if (root._trendResizeObserver) {
+      root._trendResizeObserver.disconnect();
+      root._trendResizeObserver = null;
+    }
+  });
+});
 
 // The console tab bar (`.tab-bar`) sits outside the `#tab-body` fragment that
 // `GET /app/tab/{view}` swaps in, so switching tabs would otherwise leave the

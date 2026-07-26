@@ -10,10 +10,22 @@
     <form method="post" action="/blood-tests/import"><button class="button secondary" type="submit">Import new tests</button></form>
     {% if lab_reports.is_empty() %}<p class="tracker-empty">No blood tests imported yet.</p>{% else %}
     <section class="lab-trends" data-lab-trends data-pet-name="{{ pet.name }}">
-      <div class="lab-trends-head"><div><div class="side-label">TRENDS / ALL MARKERS</div><h3>Values over time</h3></div><div class="trend-head-actions"><span class="trend-pulse" aria-hidden="true"></span><button class="trend-expand" type="button" data-trend-expand aria-expanded="false">Open full view</button></div></div>
-      <p class="trend-intro">Every marker is shown together in its own scale, so changes stay readable. This is a record of results, not a diagnosis.</p>
+      <div class="lab-trends-head"><div><div class="side-label">TRENDS / ALL MARKERS</div><h3>Values over time</h3></div><div class="trend-head-actions"><span class="trend-pulse" aria-hidden="true"></span><button class="trend-expand" type="button" data-trend-expand aria-expanded="false" aria-haspopup="dialog">Open full view</button></div></div>
+      <p class="trend-intro">One marker at a time, shown large; the rest are a strip of small history below it. Click one to bring it forward. This is a record of results, not a diagnosis.</p>
       <div class="trend-controls"><div class="trend-scope"><span>VISIBLE NOW</span><strong data-trend-count>—</strong></div><div class="trend-summary" data-trend-summary aria-live="polite"></div></div>
-      <div class="trend-chart" data-trend-chart aria-label="Blood-test trend chart"></div>
+      <div class="trend-layout" data-trend-detail-home>
+        <article class="trend-detail" data-trend-movable>
+          <div class="trend-detail-inner">
+            <header class="trend-detail-head" data-trend-detail-head></header>
+            <div class="trend-chart" data-trend-chart aria-label="Blood-test trend chart"></div>
+          </div>
+        </article>
+        <div class="trend-filmstrip" role="group" aria-label="Other markers — select one to view it large" data-trend-filmstrip></div>
+      </div>
+      <dialog class="trend-dialog" data-trend-dialog aria-label="Blood-test trend, full view">
+        <div class="trend-dialog-head"><span class="side-label">FULL VIEW</span><button class="button secondary" type="button" data-trend-dialog-close>Close full view</button></div>
+        <div class="trend-dialog-slot" data-trend-dialog-slot></div>
+      </dialog>
       <div class="trend-table-wrap"><table class="trend-table"><caption class="sr-only">All blood-test values over time</caption><thead><tr><th>Marker</th><th>Date</th><th>Value</th><th>Reference</th></tr></thead><tbody data-trend-table></tbody></table></div>
       <div class="trend-points" aria-hidden="true">
         {% for report in lab_reports %}{% match report.test_date %}{% when Some with (date) %}{% for result in report.results %}{% match result.value_numeric %}{% when Some with (value) %}<span data-lab-point data-test="{{ result.test_name }}" data-date="{{ date }}" data-value="{{ value }}" data-unit="{% match result.unit %}{% when Some with (unit) %}{{ unit }}{% when None %}{% endmatch %}" data-reference="{% match result.reference_range %}{% when Some with (range) %}{{ range }}{% when None %}{% endmatch %}" data-flag="{% match result.flag %}{% when Some with (flag) %}{{ flag }}{% when None %}{% endmatch %}"></span>{% when None %}{% endmatch %}{% endfor %}{% when None %}{% endmatch %}{% endfor %}

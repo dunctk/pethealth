@@ -544,3 +544,152 @@ function initAllTimelineFilters() {
 
 document.addEventListener("DOMContentLoaded", initAllTimelineFilters);
 document.addEventListener("htmx:afterSwap", initAllTimelineFilters);
+
+// Phase 4 (UI_REDESIGN_PLAN.md §4): the "+ Record" menu opens a weight/dose/
+// lab/symptom form in `#record-dialog`, and clicking a timeline entry opens
+// its detail in `#entry-drawer`. Both are native <dialog>s wired the same
+// way Phase 3 wired the lab-trends fullscreen dialog: track the element that
+// had focus before showModal() and restore it on the dialog's `close` event,
+// which fires alike for Escape, the close button, and a clicking outside —
+// see `wireDialog`'s `_openHere` below and the `dialog.addEventListener`
+// `close` handler in `initLabTrends` above for the same pattern.
+function wireDialog(dialog) {
+  if (!dialog || dialog.dataset.wired === "true") return;
+  dialog.dataset.wired = "true";
+  let previouslyFocused = null;
+  // Takes an explicit opener element when the caller has one, rather than
+  // always reading `document.activeElement` at call time: for the
+  // "+ Record" menu, the click handler that closes the `<details>` popover
+  // runs (and can drop focus to <body>) before the async `hx-get` finishes
+  // and this actually runs, so by then `document.activeElement` may no
+  // longer be the button that was clicked. `_pendingOpener` (set by that
+  // click handler below) survives that gap; `document.activeElement` is
+  // still the right fallback for the drawer, whose "→" button never gets
+  // detached or hidden before this runs.
+  dialog._openHere = (opener) => {
+    if (dialog.open) return;
+    previouslyFocused = opener || dialog._pendingOpener || document.activeElement;
+    dialog._pendingOpener = null;
+    dialog.showModal();
+  };
+  dialog.addEventListener("close", () => {
+    if (previouslyFocused && document.contains(previouslyFocused) && typeof previouslyFocused.focus === "function") {
+      previouslyFocused.focus();
+    }
+    previouslyFocused = null;
+  });
+  dialog.querySelectorAll("[data-close-record-dialog], [data-close-drawer]").forEach((button) => {
+    button.addEventListener("click", () => dialog.close());
+  });
+}
+
+// The dialog only opens once its content has actually arrived (this fires
+// right after that swap), rather than on the triggering click — opening on
+// click would show a flash of stale or empty content while the request is
+// still in flight. Both `#record-dialog` and `#entry-drawer` are wired here
+// unconditionally on every swap: `#entry-drawer` in particular lives inside
+// `_agent_timeline.html`, which is itself replaced wholesale by tab
+// switches, capture, undo, and every `+ Record` dialog submission — so it is
+// a fresh, unwired node most of the time, and `wireDialog`'s dataset guard
+// makes re-wiring it on every swap a no-op the rest of the time.
+document.addEventListener("htmx:afterSwap", (event) => {
+  const target = event.target;
+  if (!target) return;
+  wireDialog(document.getElementById("record-dialog"));
+  wireDialog(document.getElementById("entry-drawer"));
+  if (target.id === "record-dialog-slot") {
+    const dialog = document.getElementById("record-dialog");
+    if (dialog) dialog._openHere();
+  }
+  if (target.id === "drawer-slot") {
+    const dialog = document.getElementById("entry-drawer");
+    if (dialog) dialog._openHere();
+  }
+});
+
+document.addEventListener("DOMContentLoaded", () => {
+  wireDialog(document.getElementById("record-dialog"));
+  wireDialog(document.getElementById("entry-drawer"));
+});
+
+// Picking a "+ Record" option closes the details/summary popover immediately
+// (it would otherwise stay open, visible behind the modal <dialog>). Stash
+// the menu's own `<summary>` as `_pendingOpener` first, not the menu item
+// itself — see the comment on `_openHere` above for the timing reason this
+// has to be captured now rather than read from `document.activeElement`
+// later, and note it can't be the menu item: collapsing the `<details>` on
+// the next line makes that item unfocusable (its content is no longer
+// rendered), so restoring focus to it on close would silently no-op and
+// focus would fall back to <body>. The summary stays visible and focusable
+// throughout, and is the more sensible place for focus to land back on
+// anyway — it's the control the visitor actually reopens "+ Record" from.
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-open-record-dialog]");
+  if (!button) return;
+  const menu = button.closest(".record-menu");
+  const dialog = document.getElementById("record-dialog");
+  if (dialog) dialog._pendingOpener = menu ? menu.querySelector("summary") : button;
+  if (menu) menu.removeAttribute("open");
+});
+
+// A "+ Record" dialog write (weight/dose/symptom/lab) wraps the affected
+// region's refreshed HTML in an inert `<template id="...">` (see
+// `as_refresh_template` in web.rs) instead of using htmx's own
+// `hx-swap-oob="true"`. htmx's built-in oob swap logs a console error
+// (`htmx:oobErrorNoTarget`) whenever the target id isn't present in the
+// current page — which happens on every one of these writes made from a tab
+// other than the one that shows that region, since "+ Record" is reachable
+// from any tab. Doing the swap by hand here is a real no-op instead: if the
+// target isn't on screen, there's simply nothing stale to refresh.
+function applyManualRefresh(responseText, templateId, targetId) {
+  const target = document.getElementById(targetId);
+  if (!target || !responseText || !responseText.includes(templateId)) return;
+  const parsed = new DOMParser().parseFromString(responseText, "text/html");
+  const template = parsed.getElementById(templateId);
+  const replacement = template && "content" in template ? template.content.firstElementChild : null;
+  if (!replacement) return;
+  // `target` (the outgoing node) never goes through htmx's own swap
+  // pipeline here, so `htmx:beforeCleanupElement` (which `initLabTrends`'s
+  // ResizeObserver relies on — see the comment on `root._trendResizeObserver`
+  // above) never fires for it. Disconnect it by hand before it's detached, or
+  // it leaks one ResizeObserver per successful "+ Record → Lab" upload made
+  // while already viewing the Labs tab.
+  if (targetId === "labs-tab") {
+    target.querySelectorAll("[data-lab-trends]").forEach((root) => {
+      if (root._trendResizeObserver) {
+        root._trendResizeObserver.disconnect();
+        root._trendResizeObserver = null;
+      }
+    });
+  }
+  target.replaceWith(replacement);
+  // htmx binds `hx-*` attributes when it processes a subtree, and it never saw
+  // this one — the nodes came from `DOMParser`, not from an htmx swap. Without
+  // this the refreshed markup is inert: Undo, "Load older" and the drawer
+  // trigger all silently stop responding until the next full page load.
+  window.htmx?.process(replacement);
+  // The replaced node is new to the DOM and was never seen by htmx's own
+  // `htmx:afterSwap` (this wasn't an htmx swap), so anything that
+  // initializes on that event has to be re-run by hand for it.
+  if (targetId === "agent-and-timeline") {
+    initAllTimelineFilters();
+    wireDialog(document.getElementById("entry-drawer"));
+  } else if (targetId === "labs-tab") {
+    initAllLabTrends();
+  }
+}
+
+// Closes the currently open dialog after a successful submit from inside it
+// (the weight/dose/symptom/lab forms, marked `data-dialog-form`), so the
+// user isn't left staring at a dialog whose form just saved. A failed submit
+// (4xx) leaves the dialog open with the validation message shown in its own
+// status area instead.
+document.addEventListener("htmx:afterRequest", (event) => {
+  const form = event.target.closest && event.target.closest("[data-dialog-form]");
+  if (!form || !event.detail.successful) return;
+  const responseText = event.detail.xhr && event.detail.xhr.responseText;
+  applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
+  applyManualRefresh(responseText, "labs-refresh", "labs-tab");
+  const dialog = form.closest("dialog");
+  if (dialog && dialog.open) dialog.close();
+});

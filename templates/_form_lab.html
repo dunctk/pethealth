@@ -1,0 +1,7 @@
+<form method="post" action="/blood-tests/upload" enctype="multipart/form-data" class="tracker-form dialog-form" data-dialog-form hx-post="/blood-tests/upload" hx-target="#record-form-status" hx-swap="innerHTML" hx-encoding="multipart/form-data">
+  <input type="hidden" name="pet_id" value="{{ pet.id }}">
+  <label class="full-width">Lab report<input required type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.avif,application/pdf,image/*"></label>
+  <p class="full-width dialog-hint">Spanish and English reports are supported. It lands on {{ pet.name }}'s Labs tab once imported.</p>
+  <div id="record-form-status" class="dialog-status full-width" role="alert" aria-live="polite"></div>
+  <button class="button primary full-width" type="submit">Upload and import</button>
+</form>

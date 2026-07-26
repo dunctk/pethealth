@@ -1,0 +1,12 @@
+<form method="post" action="/medications" class="tracker-form dialog-form" data-dialog-form hx-post="/medications" hx-target="#record-form-status" hx-swap="innerHTML">
+  <input type="hidden" name="pet_id" value="{{ pet.id }}">
+  <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="Medication name"></label>
+  <label>Active ingredient<input maxlength="120" name="active_ingredient" placeholder="Active ingredient"></label>
+  <label>Dose<input type="number" min="0" step="0.001" name="dose_value" placeholder="16"></label>
+  <label>Unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
+  <label>Route<select name="route"><option value="">Not recorded</option><option>by mouth</option><option>injection</option><option>topical</option><option>other</option></select></label>
+  <label>Status<select name="status"><option value="given">Given</option><option value="missed">Missed</option><option value="extra">Extra dose</option><option value="vomited_back">Vomited back</option></select></label>
+  <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="500" name="note" placeholder="With food"></label>
+  <div id="record-form-status" class="dialog-status full-width" role="alert" aria-live="polite"></div>
+  <button class="button primary full-width" type="submit">Save dose with current time</button>
+</form>

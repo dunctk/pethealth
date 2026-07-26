@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{{ title }} · Pet Health</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V" crossorigin="anonymous"></script>
+</head>
+<body>
+  {#- This wrapper only ever renders when a "+ Record" form (or the entry
+      drawer) fragment route is hit directly, without htmx and without the
+      dialog it normally opens inside — see `standalone_or_fragment` in
+      web.rs. It exists purely so that direct hit is a usable page instead of
+      a bare, unstyled `<form>`, per UI_REDESIGN_PLAN.md §4A's
+      progressive-enhancement constraint. -#}
+  <div class="standalone-shell">
+    <a class="back-console" href="/app?pet={{ pet_id }}">← Back to {{ pet_name }}</a>
+    <h1>{{ title }}</h1>
+    <div class="standalone-body">{{ body|safe }}</div>
+  </div>
+</body>
+</html>

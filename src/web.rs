@@ -16,7 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 const CSS: &str = include_str!("../static/app.css");
 
@@ -25,6 +25,11 @@ pub fn router(state: AppState) -> Router {
         .route("/app", get(index))
         .route("/app/tab/{view}", get(tab_fragment))
         .route("/app/timeline/older", get(timeline_older))
+        .route("/app/forms/weight", get(record_form_weight))
+        .route("/app/forms/dose", get(record_form_dose))
+        .route("/app/forms/symptom", get(record_form_symptom))
+        .route("/app/forms/lab", get(record_form_lab))
+        .route("/app/events/{id}/drawer", get(event_drawer))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
         .route("/symptoms", post(create_symptom))
@@ -429,13 +434,10 @@ async fn render_tab_from_data(
 ) -> Result<String, AppError> {
     let html = match view {
         ConsoleView::Timeline => {
-            let knowledge = knowledge_for_events(state, &data.events).await?;
-            let related_count = match data.events.first() {
-                Some(event) => {
-                    db::count_related(&state.db, household_id, pet.id, &event.concept).await?
-                }
-                None => 0,
-            };
+            // The old knowledge card (with `related_count`) that used to live
+            // here, scoped to only the most recent event, is gone — Phase 4
+            // replaced it with a per-entry drawer (`event_drawer`) opened from
+            // whichever entry the visitor actually clicks.
             let raw_entries = db::list_timeline(
                 &state.db,
                 household_id,
@@ -452,10 +454,9 @@ async fn render_tab_from_data(
                 days: group_timeline_by_day(entries, None),
                 entries_count,
                 next_cursor,
-                knowledge,
-                related_count,
                 capture_message: None,
                 capture_error: None,
+                load_more_oob: false,
             }
             .render()?
         }
@@ -550,6 +551,141 @@ async fn tab_fragment(
     Ok(Html(html))
 }
 
+/// `true` for an `hx-get`/`hx-post` request (htmx always sends this header),
+/// `false` for a plain browser navigation or form submission. Every
+/// `+ Record` fragment route and dialog-form POST branches on this: htmx
+/// requests get the small fragment meant for a `<dialog>` or an
+/// out-of-band swap, anything else gets a full, standalone response so the
+/// same route works with the dialog system turned off (`UI_REDESIGN_PLAN.md`
+/// §4A's progressive-enhancement constraint).
+fn wants_fragment(headers: &HeaderMap) -> bool {
+    headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true")
+}
+
+#[derive(Deserialize)]
+struct PetQuery {
+    pet: i64,
+}
+
+/// Wraps a `+ Record` dialog form (or the drawer body) for direct, non-htmx
+/// navigation: the fragment routes this feeds are built to render *just* the
+/// form/detail partial for `hx-get`, but hitting the same URL directly in a
+/// browser must still produce a usable page, not a bare, unstyled `<form>`
+/// dropped in with no chrome (`UI_REDESIGN_PLAN.md` §4A).
+fn standalone_or_fragment(
+    headers: &HeaderMap,
+    title: &str,
+    pet: &Pet,
+    body: String,
+) -> Result<Html<String>, AppError> {
+    if wants_fragment(headers) {
+        Ok(Html(body))
+    } else {
+        render(&StandaloneTemplate {
+            title: title.to_owned(),
+            pet_id: pet.id,
+            pet_name: pet.name.clone(),
+            body,
+        })
+    }
+}
+
+/// `GET /app/forms/weight` — `+ Record → Weight`. Household-scoped via
+/// `db::get_pet`; the `pet` query-string value is never trusted otherwise.
+async fn record_form_weight(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Query(query): Query<PetQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let body = FormWeightTemplate { pet: pet.clone() }.render()?;
+    standalone_or_fragment(&headers, "Add weight", &pet, body)
+}
+
+/// `GET /app/forms/dose` — `+ Record → Dose`. Household-scoped via `db::get_pet`.
+async fn record_form_dose(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Query(query): Query<PetQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let body = FormDoseTemplate { pet: pet.clone() }.render()?;
+    standalone_or_fragment(&headers, "Log a dose", &pet, body)
+}
+
+/// `GET /app/forms/symptom` — `+ Record → Symptom`. This is the structured
+/// symptom form migrated out of its old always-on `<details>` in
+/// `_agent_timeline.html` (`UI_REDESIGN_PLAN.md` §4A migration table).
+/// Household-scoped via `db::get_pet`.
+async fn record_form_symptom(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Query(query): Query<PetQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let body = FormSymptomTemplate { pet: pet.clone() }.render()?;
+    standalone_or_fragment(&headers, "Structured symptom record", &pet, body)
+}
+
+/// `GET /app/forms/lab` — `+ Record → Lab`. The same upload form that lives
+/// permanently in the Labs tab, also reachable as a dialog shortcut.
+/// Household-scoped via `db::get_pet`.
+async fn record_form_lab(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Query(query): Query<PetQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let body = FormLabTemplate { pet: pet.clone() }.render()?;
+    standalone_or_fragment(&headers, "Upload a blood test", &pet, body)
+}
+
+/// `GET /app/events/{id}/drawer` — the transient knowledge drawer opened from
+/// a Timeline entry (`UI_REDESIGN_PLAN.md` §4B). Only `TimelineEntry::Event`
+/// rows are clickable for this: they are the one timeline source with a
+/// `concept` a knowledge article can be looked up by. Household- *and*
+/// pet-scoped: `db::get_pet` first, then `db::get_event(household_id, pet.id,
+/// event_id)` so an event id from the query string can never resolve another
+/// household's (or another pet's) event.
+async fn event_drawer(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Path(event_id): Path<i64>,
+    Query(query): Query<PetQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let event = db::get_event(&state.db, user.household_id, pet.id, event_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let related_count =
+        db::count_related(&state.db, user.household_id, pet.id, &event.concept).await?;
+    let knowledge = db::get_knowledge(&state.db, &event.concept).await?;
+    let body = DrawerTemplate {
+        event,
+        knowledge,
+        related_count,
+    }
+    .render()?;
+    standalone_or_fragment(&headers, "Entry detail", &pet, body)
+}
+
 #[derive(Deserialize)]
 struct PetForm {
     name: String,
@@ -598,14 +734,12 @@ struct WeightForm {
 async fn create_weight(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
     Form(form): Form<WeightForm>,
-) -> Result<Redirect, AppError> {
-    if db::get_pet(&state.db, user.household_id, form.pet_id)
+) -> Result<Response, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
         .await?
-        .is_none()
-    {
-        return Err(AppError::not_found());
-    }
+        .ok_or_else(AppError::not_found)?;
     if !(0.01..=500.0).contains(&form.weight_kg) {
         return Err(AppError::validation(
             "Weight must be between 0.01 and 500 kg.",
@@ -627,7 +761,7 @@ async fn create_weight(
         clean_optional(form.note.as_deref(), 240),
     )
     .await?;
-    Ok(Redirect::to(&format!("/app?pet={}", form.pet_id)))
+    timeline_write_response(&state, &headers, user.household_id, pet, "Saved weight.").await
 }
 
 #[derive(Deserialize)]
@@ -635,6 +769,7 @@ struct SymptomForm {
     pet_id: i64,
     symptom: String,
     raw_input: String,
+    #[serde(default, deserialize_with = "empty_str_as_none")]
     occurrence_count: Option<i64>,
     amount: Option<String>,
     contents: Option<String>,
@@ -649,6 +784,7 @@ struct SymptomForm {
 async fn create_symptom(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
     Form(form): Form<SymptomForm>,
 ) -> Result<Response, AppError> {
     let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
@@ -682,15 +818,14 @@ async fn create_symptom(
         "owner_form",
     )
     .await?;
-    let template = render_agent_timeline(
+    timeline_write_response(
         &state,
+        &headers,
         user.household_id,
-        Some(pet),
-        Some("Saved structured symptom record.".into()),
-        None,
+        pet,
+        "Saved structured symptom record.",
     )
-    .await?;
-    render(&template).map(IntoResponse::into_response)
+    .await
 }
 
 #[derive(Deserialize)]
@@ -698,6 +833,7 @@ struct MedicationForm {
     pet_id: i64,
     name: String,
     active_ingredient: Option<String>,
+    #[serde(default, deserialize_with = "empty_str_as_none")]
     dose_value: Option<f64>,
     dose_unit: Option<String>,
     route: Option<String>,
@@ -708,8 +844,9 @@ struct MedicationForm {
 async fn create_medication(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
     Form(form): Form<MedicationForm>,
-) -> Result<Redirect, AppError> {
+) -> Result<Response, AppError> {
     let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
         .await?
         .ok_or_else(AppError::not_found)?;
@@ -736,7 +873,7 @@ async fn create_medication(
         clean_optional(form.note.as_deref(), 500),
     )
     .await?;
-    Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
+    timeline_write_response(&state, &headers, user.household_id, pet, "Saved dose.").await
 }
 
 #[derive(Deserialize)]
@@ -866,21 +1003,38 @@ async fn import_blood_tests(
 async fn upload_blood_test(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<Redirect, AppError> {
+) -> Result<Response, AppError> {
     let mut uploaded = false;
+    // `pet_id` is only ever present when this form was rendered by
+    // `record_form_lab` (the Labs tab's standalone upload form predates it and
+    // has no such field) — it says which pet's Labs tab to refresh below. The
+    // upload itself stays household-wide, matching `ocr::import_directory`'s
+    // existing behaviour, so a missing or invalid `pet_id` here does not
+    // affect whether the upload succeeds, only which OOB view (if any) comes
+    // back with it.
+    let mut pet_id: Option<i64> = None;
     while let Some(field) = multipart.next_field().await? {
-        if field.name() != Some("file") {
-            continue;
+        match field.name() {
+            Some("file") => {
+                let filename = field
+                    .file_name()
+                    .ok_or_else(|| AppError::validation("Choose a blood-test file."))?
+                    .to_owned();
+                let bytes = field.bytes().await?;
+                ocr::store_upload(&state.config, user.household_id, &filename, &bytes).await?;
+                uploaded = true;
+            }
+            Some("pet_id") => {
+                pet_id = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok());
+            }
+            _ => {}
         }
-        let filename = field
-            .file_name()
-            .ok_or_else(|| AppError::validation("Choose a blood-test file."))?
-            .to_owned();
-        let bytes = field.bytes().await?;
-        ocr::store_upload(&state.config, user.household_id, &filename, &bytes).await?;
-        uploaded = true;
-        break;
     }
     if !uploaded {
         return Err(AppError::validation("Choose a blood-test file."));
@@ -899,7 +1053,38 @@ async fn upload_blood_test(
         .filter(|item| item.report_id.is_some())
         .count();
     tracing::info!(user = user.id, imported_count, "blood-test upload finished");
-    Ok(Redirect::to("/app"))
+
+    // Household-scoped exactly like every other fragment route (`AGENTS.md`):
+    // `pet_id` (a hidden form field, not directly attacker-controlled, but
+    // never trusted regardless) only selects which pet's Labs tab is shown
+    // back after re-checking it via `db::get_pet`.
+    let scoped_pet = match pet_id {
+        Some(id) => db::get_pet(&state.db, user.household_id, id).await?,
+        None => None,
+    };
+    if wants_fragment(&headers) {
+        return match scoped_pet {
+            Some(pet) => {
+                let lab_reports =
+                    db::list_lab_reports(&state.db, user.household_id, pet.id).await?;
+                let rendered = TabLabsTemplate { pet, lab_reports }.render()?;
+                // See `as_refresh_template`'s doc comment: this is a manual
+                // client-side swap, not htmx's `hx-swap-oob`, so a "+ Record
+                // → Lab" upload from a tab other than Labs doesn't log
+                // `htmx:oobErrorNoTarget`.
+                let html = as_refresh_template("labs-refresh", rendered);
+                Ok((StatusCode::OK, Html(html)).into_response())
+            }
+            // No usable pet context: still a successful upload, just nothing
+            // to refresh in place — the dialog still closes on success.
+            None => Ok(Html(String::new()).into_response()),
+        };
+    }
+    let redirect = match scoped_pet {
+        Some(pet) => format!("/app?pet={}&view=labs", pet.id),
+        None => "/app".to_owned(),
+    };
+    Ok(Redirect::to(&redirect).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1055,6 +1240,7 @@ async fn timeline_older(
         pet_id: pet.id,
         days,
         next_cursor,
+        load_more_oob: true,
     })
 }
 
@@ -1190,11 +1376,19 @@ async fn selected_from(
     }
 }
 
-/// Builds the `AgentTimelineTemplate` shared by `capture`, `create_symptom` and
-/// `undo_event`: all three swap `#agent-and-timeline` back in via HTMX after a
-/// write, and after Phase 2 that swap must show the merged timeline (all four
-/// sources), not just `health_events`. Household-scoped through `selected_pet`,
-/// which every caller already resolved via `db::get_pet`/`selected_from`.
+/// Builds the `AgentTimelineTemplate` shared by `capture`, `create_symptom`,
+/// `undo_event`, and the `+ Record` dialog writes (weight, dose, structured
+/// symptom): all swap `#agent-and-timeline` back in after a write, and after
+/// Phase 2 that swap must show the merged timeline (all four sources), not
+/// just `health_events`. Household-scoped through `selected_pet`, which every
+/// caller already resolved via `db::get_pet`/`selected_from`.
+///
+/// `capture` and `undo_event` target `#agent-and-timeline` directly
+/// (`hx-swap="outerHTML"`) from a form that only ever exists while that
+/// element is already on screen. The `+ Record` dialog writes are reachable
+/// from *any* tab, so they can't assume that — see `timeline_write_response`,
+/// which wraps this same rendering in an inert `<template>` for those
+/// callers instead of targeting `#agent-and-timeline` at all.
 async fn render_agent_timeline(
     state: &AppState,
     household_id: i64,
@@ -1233,16 +1427,88 @@ async fn render_agent_timeline(
         next_cursor,
         capture_message,
         capture_error,
+        load_more_oob: false,
     })
 }
 
-async fn knowledge_for_events(
+/// Wraps an HTML fragment in an inert, unswapped `<template>` tagged with
+/// `id`. `<template>` content lives in a separate document fragment — it is
+/// never rendered and, critically, htmx's own out-of-band swap scan
+/// (`querySelectorAll('[hx-swap-oob]')` over the *response* fragment) does
+/// not descend into it, so nothing here is ever a candidate for htmx's own
+/// oob handling. `static/app.js`'s `htmx:afterRequest` handler pulls this
+/// back out of `event.detail.xhr.responseText` with a `DOMParser` and swaps
+/// it in manually with plain `Element.replaceWith`, but *only* if the target
+/// id is actually present in the current page — otherwise it's a no-op.
+///
+/// This exists because htmx's built-in `hx-swap-oob="true"` does the
+/// opposite of what `UI_REDESIGN_PLAN.md` §4A needs here: when no element
+/// with the given id exists in the requester's current DOM (e.g. the
+/// "+ Record" dialog was opened from the Plan tab, so `#agent-and-timeline`
+/// isn't on screen), htmx doesn't silently skip it — it logs
+/// `htmx:oobErrorNoTarget` to the console, which is a real console error
+/// hit on every non-Timeline-tab weight/dose/symptom save. Manual swapping
+/// gets the "quietly do nothing if it isn't there" behaviour this route
+/// actually wants.
+fn as_refresh_template(id: &str, html: String) -> String {
+    format!(r#"<template id="{id}">{html}</template>"#)
+}
+
+/// Shared response for the three `+ Record` dialog forms that affect the
+/// Timeline — weight, dose, and the structured symptom record
+/// (`UI_REDESIGN_PLAN.md` §4A). An htmx request gets `#agent-and-timeline`'s
+/// refreshed content wrapped for the manual swap described on
+/// `as_refresh_template`; a plain, non-htmx submission — the
+/// progressive-enhancement path — gets a normal redirect back to the
+/// Timeline tab, matching what these routes did before Phase 4 moved their
+/// forms into dialogs.
+async fn timeline_write_response(
     state: &AppState,
-    events: &[HealthEvent],
-) -> Result<Option<KnowledgeArticle>, AppError> {
-    match events.first() {
-        Some(event) => Ok(db::get_knowledge(&state.db, &event.concept).await?),
+    headers: &HeaderMap,
+    household_id: i64,
+    pet: Pet,
+    message: &str,
+) -> Result<Response, AppError> {
+    if wants_fragment(headers) {
+        let template = render_agent_timeline(
+            state,
+            household_id,
+            Some(pet),
+            Some(message.to_owned()),
+            None,
+        )
+        .await?;
+        let html = as_refresh_template("timeline-refresh", template.render()?);
+        Ok((StatusCode::OK, Html(html)).into_response())
+    } else {
+        Ok(Redirect::to(&format!("/app?pet={}&view=timeline", pet.id)).into_response())
+    }
+}
+
+/// Pre-existing bug, surfaced by Phase 4: axum's `Form` extractor (via
+/// `serde_html_form`) does *not* treat an empty string as `None` for an
+/// `Option<f64>`/`Option<i64>` field — it tries to parse `""` as the number
+/// and the whole request 422s with a raw "Failed to deserialize form body"
+/// error that never reaches `AppError` (so nothing renders in the dialog's
+/// status area at all). `dose_value` and `occurrence_count` are the two such
+/// fields the "+ Record" dialogs post — before Phase 4 they sat in a rarely
+/// opened `<details>`, so leaving them blank was rare enough this went
+/// unnoticed. Used via `#[serde(default, deserialize_with =
+/// "empty_str_as_none")]`.
+fn empty_str_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match Option::<String>::deserialize(deserializer)? {
         None => Ok(None),
+        Some(value) if value.trim().is_empty() => Ok(None),
+        Some(value) => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -1422,10 +1688,12 @@ struct TabTimelineTemplate {
     days: Vec<TimelineDay>,
     entries_count: usize,
     next_cursor: Option<TimelineCursor>,
-    knowledge: Option<KnowledgeArticle>,
-    related_count: u64,
     capture_message: Option<String>,
     capture_error: Option<String>,
+    /// `_tab_timeline.html` is just `{% include "_agent_timeline.html") %}`, so
+    /// this struct must carry every field that template reads. See
+    /// `_timeline_load_more.html`'s doc comment. Always `false` here.
+    load_more_oob: bool,
 }
 
 #[derive(Template)]
@@ -1451,6 +1719,52 @@ struct TabSharingTemplate {
     pet: Pet,
     shares: Vec<ShareGrant>,
     new_share_path: Option<String>,
+}
+
+/// Wraps a `+ Record` form partial (or the drawer body) for direct, non-htmx
+/// navigation. See `standalone_or_fragment`.
+#[derive(Template)]
+#[template(path = "_standalone.html")]
+struct StandaloneTemplate {
+    title: String,
+    pet_id: i64,
+    pet_name: String,
+    body: String,
+}
+
+#[derive(Template)]
+#[template(path = "_form_weight.html")]
+struct FormWeightTemplate {
+    pet: Pet,
+}
+
+#[derive(Template)]
+#[template(path = "_form_dose.html")]
+struct FormDoseTemplate {
+    pet: Pet,
+}
+
+#[derive(Template)]
+#[template(path = "_form_symptom.html")]
+struct FormSymptomTemplate {
+    pet: Pet,
+}
+
+#[derive(Template)]
+#[template(path = "_form_lab.html")]
+struct FormLabTemplate {
+    pet: Pet,
+}
+
+/// The transient knowledge drawer body (`UI_REDESIGN_PLAN.md` §4B): the
+/// knowledge article for the clicked event's concept, plus how many other
+/// active events share that concept.
+#[derive(Template)]
+#[template(path = "_drawer.html")]
+struct DrawerTemplate {
+    event: HealthEvent,
+    knowledge: Option<KnowledgeArticle>,
+    related_count: u64,
 }
 
 #[derive(Template)]
@@ -1487,6 +1801,13 @@ struct AgentTimelineTemplate {
     next_cursor: Option<TimelineCursor>,
     capture_message: Option<String>,
     capture_error: Option<String>,
+    /// See `_timeline_load_more.html`'s doc comment. Always `false` here —
+    /// `render_agent_timeline` is the only place that constructs this
+    /// template, and every one of its callers either swaps
+    /// `#agent-and-timeline` in directly or wraps this whole render for a
+    /// manual swap (`as_refresh_template`), so this div should just ride
+    /// along as ordinary content rather than be independently oob-swapped.
+    load_more_oob: bool,
 }
 
 /// The `hx-get="/app/timeline/older"` response: the next page's rows plus an
@@ -1497,6 +1818,11 @@ struct TimelineOlderTemplate {
     pet_id: i64,
     days: Vec<TimelineDay>,
     next_cursor: Option<TimelineCursor>,
+    /// See `_timeline_load_more.html`'s doc comment. Always `true` here: this
+    /// is the one response where the "Load older" trigger lives outside the
+    /// element (`#timeline-entries`) actually being swapped, so it needs its
+    /// own independent out-of-band update.
+    load_more_oob: bool,
 }
 
 #[derive(Template)]

@@ -1,0 +1,16 @@
+<form method="post" action="/symptoms" class="structured-form dialog-form" data-dialog-form hx-post="/symptoms" hx-target="#record-form-status" hx-swap="innerHTML">
+  <input type="hidden" name="pet_id" value="{{ pet.id }}">
+  <label>Symptom<select name="symptom"><option value="vomiting">Vomiting</option><option value="diarrhea">Diarrhea</option><option value="reduced_appetite">Reduced appetite</option></select></label>
+  <label>Original wording<input required maxlength="1000" name="raw_input" value="{{ pet.name }} vomited just now"></label>
+  <label>Count<input type="number" min="1" max="100" name="occurrence_count" placeholder="1"></label>
+  <label>Amount<select name="amount"><option value="">Not sure</option><option>small</option><option>medium</option><option>large</option></select></label>
+  <label>Contents<select name="contents"><option value="">Not sure</option><option>food</option><option>foam</option><option>bile</option><option>hair</option><option>blood</option><option>foreign material</option></select></label>
+  <label>Meal timing<select name="meal_relation"><option value="">Not sure</option><option>before eating</option><option>soon after eating</option><option>long after eating</option></select></label>
+  <label>Water afterward<select name="water_status"><option value="">Not recorded</option><option>kept water down</option><option>vomited water</option><option>did not drink</option></select></label>
+  <label>Appetite<select name="appetite_status"><option value="">Not recorded</option><option>normal</option><option>reduced</option><option>refused food</option></select></label>
+  <label>Energy<select name="energy_status"><option value="">Not recorded</option><option>normal</option><option>quiet</option><option>lethargic</option></select></label>
+  <label>Pain<select name="pain_status"><option value="">Not recorded</option><option>none noticed</option><option>possible</option><option>obvious</option></select></label>
+  <label class="full-width">Extra note <span class="field-hint">optional</span><textarea name="note" maxlength="500" rows="2" placeholder="Anything else you saw"></textarea></label>
+  <div id="record-form-status" class="dialog-status full-width" role="alert" aria-live="polite"></div>
+  <button class="button primary full-width" type="submit">Save with current time</button>
+</form>

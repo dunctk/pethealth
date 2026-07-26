@@ -58,38 +58,14 @@
   <section class="plan-log">
     <div class="side-label">MEDICATION TIMELINE</div>
     <h3>Doses given</h3>
-    <p>Record what was actually given. Exact product and dose timing help spot patterns without guessing cause.</p>
-    <details class="plan-add">
-      <summary><span class="structured-pulse">+</span><span><b>Log a dose</b><small>Saved with the current time</small></span></summary>
-      <form method="post" action="/medications" class="tracker-form">
-        <input type="hidden" name="pet_id" value="{{ pet.id }}">
-        <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="Medication name"></label>
-        <label>Active ingredient<input maxlength="120" name="active_ingredient" placeholder="Active ingredient"></label>
-        <label>Dose<input type="number" min="0" step="0.001" name="dose_value" placeholder="16"></label>
-        <label>Unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
-        <label>Route<select name="route"><option value="">Not recorded</option><option>by mouth</option><option>injection</option><option>topical</option><option>other</option></select></label>
-        <label>Status<select name="status"><option value="given">Given</option><option value="missed">Missed</option><option value="extra">Extra dose</option><option value="vomited_back">Vomited back</option></select></label>
-        <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="500" name="note" placeholder="With food"></label>
-        <button class="button secondary full-width" type="submit">Save dose with current time</button>
-      </form>
-    </details>
+    <p>Record what was actually given. Exact product and dose timing help spot patterns without guessing cause. Use <b>+ Record → Dose</b> in the header above to log one.</p>
     {% if medications.is_empty() %}<p class="tracker-empty">No medication exposures recorded yet.</p>{% else %}<div class="medication-list">{% for medication in medications %}<div class="medication-row"><strong>{{ medication.name }}</strong><span>{{ medication.administered_at.format("%d %b, %H:%M") }}{% match medication.dose_value %}{% when Some with (dose) %}<small>{{ dose }}{% match medication.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>{% endif %}
   </section>
 
   <section class="plan-log">
     <div class="side-label">WEIGHT OVER TIME</div>
     <h3>Weight</h3>
-    <p>Add a measurement whenever you weigh your pet. The list stays in date order.</p>
-    <details class="plan-add">
-      <summary><span class="structured-pulse">+</span><span><b>Add weight</b><small>Track it over time</small></span></summary>
-      <form method="post" action="/weights" class="tracker-form">
-        <input type="hidden" name="pet_id" value="{{ pet.id }}">
-        <label>Weight, kg<input required type="number" min="0.01" max="500" step="0.01" name="weight_kg" placeholder="12.4"></label>
-        <label>Date<input required type="date" name="measured_at"></label>
-        <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="240" name="note" placeholder="After dinner"></label>
-        <button class="button secondary full-width" type="submit">Save weight</button>
-      </form>
-    </details>
+    <p>Add a measurement whenever you weigh your pet. Use <b>+ Record → Weight</b> in the header above; the list stays in date order.</p>
     {% if weights.is_empty() %}<p class="tracker-empty">No weight measurements yet.</p>{% else %}
     <div class="weight-list">{% for weight in weights %}<div class="weight-row"><strong>{{ weight.weight_kg }} kg</strong><span>{{ weight.measured_at }}{% match weight.note %}{% when Some with (note) %}<small>{{ note }}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>
     {% endif %}

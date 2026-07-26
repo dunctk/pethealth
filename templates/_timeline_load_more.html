@@ -1,8 +1,20 @@
+{#- `load_more_oob` distinguishes two very different callers. `/app/timeline/older`
+    (`TimelineOlderTemplate`) targets `#timeline-entries` directly and needs this
+    div — which lives *outside* that target — patched independently, so it sets
+    `load_more_oob: true`. Every other caller (`AgentTimelineTemplate`,
+    `TabTimelineTemplate`) already has this div *inside* the element it swaps
+    (`#agent-and-timeline`, via direct outerHTML or its own `hx-swap-oob`), so it
+    comes along for free and must set `load_more_oob: false` — marking it oob
+    there too made htmx go looking for a `#timeline-load-more` that may not exist
+    yet in the current DOM (e.g. switching into the Timeline tab from another
+    tab, or a "+ Record" dialog write from a non-Timeline tab), logging a spurious
+    `htmx:oobErrorNoTarget` even though the div was going to render correctly
+    either way. -#}
 {% match next_cursor %}
 {% when Some with (cursor) %}
-<div id="timeline-load-more" class="timeline-more" hx-swap-oob="true">
+<div id="timeline-load-more" class="timeline-more"{% if load_more_oob %} hx-swap-oob="true"{% endif %}>
   <button class="quiet-action load-more" type="button" hx-get="/app/timeline/older?pet={{ pet_id }}&{{ cursor.query }}" hx-target="#timeline-entries" hx-swap="beforeend">Load older</button>
 </div>
 {% when None %}
-<div id="timeline-load-more" hx-swap-oob="true"></div>
+<div id="timeline-load-more"{% if load_more_oob %} hx-swap-oob="true"{% endif %}></div>
 {% endmatch %}

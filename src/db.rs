@@ -1515,6 +1515,35 @@ pub async fn list_events(
     rows.into_iter().map(event_from_row).collect()
 }
 
+/// A single `health_events` row, scoped by household *and* pet — used by the
+/// Phase 4 knowledge drawer (`UI_REDESIGN_PLAN.md` §4A) to resolve the event a
+/// timeline click refers to. Household- and pet-scoping here matter for the
+/// same reason as everywhere else (`AGENTS.md`): the event id in the drawer's
+/// query string is never trusted on its own. Only `status='active'` events are
+/// returned, matching `list_timeline`'s event arm, so an undone event's old
+/// drawer link 404s instead of showing stale detail.
+pub async fn get_event(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    event_id: i64,
+) -> anyhow::Result<Option<HealthEvent>> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT e.*,p.name AS pet_name,
+                s.episode_id AS symptom_episode_id,s.symptom AS symptom_kind,s.occurrence_count AS symptom_occurrence_count,
+                s.amount AS symptom_amount,s.contents AS symptom_contents,s.meal_relation AS symptom_meal_relation,
+                s.water_status AS symptom_water_status,s.appetite_status AS symptom_appetite_status,
+                s.energy_status AS symptom_energy_status,s.pain_status AS symptom_pain_status,s.note AS symptom_note
+            FROM health_events e JOIN pets p ON p.id=e.pet_id LEFT JOIN symptom_observations s ON s.event_id=e.id
+            WHERE e.household_id=? AND e.pet_id=? AND e.id=? AND e.status='active'"#,
+            [household_id.into(), pet_id.into(), event_id.into()],
+        ))
+        .await?;
+    row.map(event_from_row).transpose()
+}
+
 pub async fn count_related(
     db: &DatabaseConnection,
     household_id: i64,
@@ -2563,6 +2592,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn get_event_is_scoped_to_household_and_pet() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited",
+            Utc::now(),
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+        let event_id = list_events(&db, 1, Some(pet_id), 1)
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .id;
+
+        assert!(get_event(&db, 1, pet_id, event_id).await.unwrap().is_some());
+
+        let other_household =
+            create_account(&db, "other-drawer@example.com", "Other Owner", "hash")
+                .await
+                .unwrap();
+        let other_household_id = other_household.household_id;
+        let other_pet_id = create_pet(&db, other_household_id, "user:2", "Nala", "Dog", None, None)
+            .await
+            .unwrap();
+        // Wrong household entirely.
+        assert!(
+            get_event(&db, other_household_id, pet_id, event_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Right household, but a pet id that belongs to someone else's pet.
+        assert!(
+            get_event(&db, 1, other_pet_id, event_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        undo_event(&db, 1, "user:1", event_id).await.unwrap();
+        // Undone events drop out of the drawer just like they drop out of the
+        // timeline, so an old drawer link 404s instead of showing stale detail.
+        assert!(get_event(&db, 1, pet_id, event_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

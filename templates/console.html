@@ -50,6 +50,24 @@
       {% when Some with (pet) %}
       <section class="pet-header">
         <div><div class="eyebrow">HEALTH HISTORY / {{ pet.species|upper }}</div><h1>{{ pet.name }}</h1><p>{% match pet.breed %}{% when Some with (breed) %}{{ breed }} · {% when None %}{% endmatch %}{% match pet.weight_kg %}{% when Some with (weight) %}{{ weight }} kg{% when None %}Weight not recorded{% endmatch %}</p></div>
+        {#- UI_REDESIGN_PLAN.md §4A: structured capture is a mode, opened from
+            here, not permanently-open furniture. Each choice `hx-get`s a form
+            partial into `#record-dialog-slot`; `static/app.js` opens
+            `#record-dialog` as soon as that swap lands. A native `<details>`
+            makes the menu itself keyboard-operable for free. -#}
+        <details class="record-menu">
+          <summary aria-label="Record a structured entry"><span aria-hidden="true">+</span> Record</summary>
+          <div class="record-popover floating-material" role="menu">
+            <button type="button" role="menuitem" data-open-record-dialog hx-get="/app/forms/weight?pet={{ pet.id }}" hx-target="#record-dialog-slot" hx-swap="innerHTML">Weight</button>
+            <button type="button" role="menuitem" data-open-record-dialog hx-get="/app/forms/dose?pet={{ pet.id }}" hx-target="#record-dialog-slot" hx-swap="innerHTML">Dose</button>
+            <button type="button" role="menuitem" data-open-record-dialog hx-get="/app/forms/lab?pet={{ pet.id }}" hx-target="#record-dialog-slot" hx-swap="innerHTML">Lab</button>
+            <button type="button" role="menuitem" data-open-record-dialog hx-get="/app/forms/symptom?pet={{ pet.id }}" hx-target="#record-dialog-slot" hx-swap="innerHTML">Symptom</button>
+          </div>
+        </details>
+        <dialog class="record-dialog" id="record-dialog" aria-label="Record a structured entry">
+          <div class="record-dialog-head"><span class="side-label">RECORD</span><button class="button secondary" type="button" data-close-record-dialog>Close</button></div>
+          <div id="record-dialog-slot" class="record-dialog-slot"></div>
+        </dialog>
       </section>
       <section class="metrics" aria-label="Health summary">
         <div><small>EVENTS</small><strong>{{ events_count }}</strong><span>in this history</span></div>

@@ -1,9 +1,10 @@
-<section class="labs-tab">
+<section id="labs-tab" class="labs-tab">
   <section class="tracker-box lab-box">
     <div class="side-label">BLOOD TESTS</div>
     <h2>Bring in a lab report</h2>
     <p>Upload a PDF or image here. Each household gets its own private storage area. Spanish and English reports are supported.</p>
     <form method="post" action="/blood-tests/upload" enctype="multipart/form-data" class="tracker-form">
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
       <label class="full-width">Lab report<input required type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.avif,application/pdf,image/*"></label>
       <button class="button secondary full-width" type="submit">Upload and import</button>
     </form>

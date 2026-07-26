@@ -17,7 +17,10 @@
     <div class="symptom-facts"><span class="fact-label">STRUCTURED FACTS</span>{% match symptom.occurrence_count %}{% when Some with (count) %}<span>{{ count }}×</span>{% when None %}{% endmatch %}{% match symptom.amount %}{% when Some with (amount) %}<span>{{ amount }}</span>{% when None %}{% endmatch %}{% match symptom.contents %}{% when Some with (contents) %}<span>{{ contents }}</span>{% when None %}{% endmatch %}{% match symptom.water_status %}{% when Some with (water) %}<span>{{ water }}</span>{% when None %}{% endmatch %}</div>
     {% when None %}{% endmatch %}
   </div>
-  <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
+  <div class="event-actions">
+    <button type="button" class="event-open quiet-action" aria-haspopup="dialog" hx-get="/app/events/{{ event.id }}/drawer?pet={{ event.pet_id }}" hx-target="#drawer-slot" hx-swap="innerHTML" data-open-drawer aria-label="View detail for {{ event.summary }}">→</button>
+    <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
+  </div>
 </article>
 
 {% when TimelineEntry::Weight with (weight) %}

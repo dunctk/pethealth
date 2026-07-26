@@ -1,0 +1,8 @@
+<form method="post" action="/weights" class="tracker-form dialog-form" data-dialog-form hx-post="/weights" hx-target="#record-form-status" hx-swap="innerHTML">
+  <input type="hidden" name="pet_id" value="{{ pet.id }}">
+  <label>Weight, kg<input required type="number" min="0.01" max="500" step="0.01" name="weight_kg" placeholder="12.4"></label>
+  <label>Date<input required type="date" name="measured_at"></label>
+  <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="240" name="note" placeholder="After dinner"></label>
+  <div id="record-form-status" class="dialog-status full-width" role="alert" aria-live="polite"></div>
+  <button class="button primary full-width" type="submit">Save weight</button>
+</form>

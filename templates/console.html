@@ -52,125 +52,22 @@
         <div><div class="eyebrow">HEALTH HISTORY / {{ pet.species|upper }}</div><h1>{{ pet.name }}</h1><p>{% match pet.breed %}{% when Some with (breed) %}{{ breed }} · {% when None %}{% endmatch %}{% match pet.weight_kg %}{% when Some with (weight) %}{{ weight }} kg{% when None %}Weight not recorded{% endmatch %}</p></div>
       </section>
       <section class="metrics" aria-label="Health summary">
-        <div><small>EVENTS</small><strong>{{ events.len() }}</strong><span>in this history</span></div>
-        <div><small>LATEST WEIGHT</small><strong>{% match weights.first() %}{% when Some with (weight) %}{{ weight.weight_kg }} kg{% when None %}Not recorded{% endmatch %}</strong><span>{% match weights.first() %}{% when Some with (weight) %}{{ weight.measured_at }}{% when None %}Track it over time{% endmatch %}</span></div>
-        <div><small>VET LINKS</small><strong>{{ shares.len() }}</strong><span>shared with your vet</span></div>
+        <div><small>EVENTS</small><strong>{{ events_count }}</strong><span>in this history</span></div>
+        <div><small>LATEST WEIGHT</small><strong>{% match latest_weight %}{% when Some with (weight) %}{{ weight.weight_kg }} kg{% when None %}Not recorded{% endmatch %}</strong><span>{% match latest_weight %}{% when Some with (weight) %}{{ weight.measured_at }}{% when None %}Track it over time{% endmatch %}</span></div>
+        <div><small>VET LINKS</small><strong>{{ shares_count }}</strong><span>shared with your vet</span></div>
+        <a class="metric-link" href="/app?pet={{ pet.id }}&amp;view=plan"><small>ACTIVE PRESCRIPTIONS</small><strong>{{ active_prescription_count }}</strong><span>see the plan</span></a>
       </section>
-      {% include "_agent_timeline.html" %}
+      <nav class="tab-bar" aria-label="Pet record sections">
+        <a class="tab-link {% if view.is_timeline() %}active{% endif %}" {% if view.is_timeline() %}aria-current="page"{% endif %} href="/app?pet={{ pet.id }}&amp;view=timeline" hx-get="/app/tab/timeline?pet={{ pet.id }}" hx-target="#tab-body" hx-swap="innerHTML" hx-push-url="/app?pet={{ pet.id }}&amp;view=timeline">Timeline</a>
+        <a class="tab-link {% if view.is_plan() %}active{% endif %}" {% if view.is_plan() %}aria-current="page"{% endif %} href="/app?pet={{ pet.id }}&amp;view=plan" hx-get="/app/tab/plan?pet={{ pet.id }}" hx-target="#tab-body" hx-swap="innerHTML" hx-push-url="/app?pet={{ pet.id }}&amp;view=plan">Plan</a>
+        <a class="tab-link {% if view.is_labs() %}active{% endif %}" {% if view.is_labs() %}aria-current="page"{% endif %} href="/app?pet={{ pet.id }}&amp;view=labs" hx-get="/app/tab/labs?pet={{ pet.id }}" hx-target="#tab-body" hx-swap="innerHTML" hx-push-url="/app?pet={{ pet.id }}&amp;view=labs">Labs</a>
+        <a class="tab-link {% if view.is_sharing() %}active{% endif %}" {% if view.is_sharing() %}aria-current="page"{% endif %} href="/app?pet={{ pet.id }}&amp;view=sharing" hx-get="/app/tab/sharing?pet={{ pet.id }}" hx-target="#tab-body" hx-swap="innerHTML" hx-push-url="/app?pet={{ pet.id }}&amp;view=sharing">Sharing</a>
+      </nav>
+      <div id="tab-body" class="tab-body">{{ tab_html|safe }}</div>
       {% when None %}
       <section class="zero-state"><span class="zero-glyph">P+</span><h1>Add your first pet</h1><p>Add a pet to start a health history. You can record what happens and share it with your vet later.</p></section>
       {% endmatch %}
     </main>
-
-    <aside class="context-panel">
-      <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div></section>
-      {% match knowledge %}
-      {% when Some with (article) %}
-      <article class="knowledge-card">
-        <div class="concept-line"><span>ABOUT THIS EVENT</span><code>{{ article.concept }}</code></div>
-        <h2>{{ article.title }}</h2><p>{{ article.summary }}</p>
-        <h3>What to watch</h3><p>{{ article.monitoring }}</p>
-        <div class="urgent"><b>Seek prompt advice</b><p>{{ article.urgent_signs }}</p></div>
-        {% match article.source_url %}{% when Some with (url) %}<a href="{{ url }}" target="_blank" rel="noopener">Read the source ↗</a>{% when None %}{% endmatch %}
-      </article>
-      <div class="linked-events"><strong>{{ related_count }}</strong><span>related event{% if related_count != 1 %}s{% endif %}<small>for this pet</small></span></div>
-      {% when None %}
-      <div class="context-empty"><span>⌁</span><p>After you record an event, you'll see related history and care information here.</p></div>
-      {% endmatch %}
-      {% match selected_pet %}{% when Some with (pet) %}
-      <section class="share-box"><div class="side-label">SHARE WITH YOUR VET</div><h2>Share {{ pet.name }}'s history</h2><p>Create a link your vet can view. It expires automatically.</p>
-        <form hx-post="/shares" hx-target="#shares-region" hx-swap="outerHTML" class="share-form">
-          <input type="hidden" name="pet_id" value="{{ pet.id }}"><label>Vet or clinic<input required maxlength="120" name="label" placeholder="Dr. Ruiz"></label>
-          <label>Expires<select name="days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label>
-          <button class="button secondary" type="submit">Create vet link</button>
-        </form>
-        {% include "_shares.html" %}
-      </section>
-      {% when None %}{% endmatch %}
-      {% match selected_pet %}{% when Some with (pet) %}
-      <section class="tracker-box">
-        <div class="side-label">WEIGHT OVER TIME</div>
-        <h2>Track {{ pet.name }}'s weight</h2>
-        <p>Add a measurement whenever you weigh your pet. The list stays in date order.</p>
-        <form method="post" action="/weights" class="tracker-form">
-          <input type="hidden" name="pet_id" value="{{ pet.id }}">
-          <label>Weight, kg<input required type="number" min="0.01" max="500" step="0.01" name="weight_kg" placeholder="12.4"></label>
-          <label>Date<input required type="date" name="measured_at"></label>
-          <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="240" name="note" placeholder="After dinner"></label>
-          <button class="button secondary full-width" type="submit">Save weight</button>
-        </form>
-        {% if weights.is_empty() %}<p class="tracker-empty">No weight measurements yet.</p>{% else %}
-        <div class="weight-list">{% for weight in weights %}<div class="weight-row"><strong>{{ weight.weight_kg }} kg</strong><span>{{ weight.measured_at }}{% match weight.note %}{% when Some with (note) %}<small>{{ note }}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>
-        {% endif %}
-      </section>
-      <section class="tracker-box medication-box">
-        <div class="side-label">MEDICATION TIMELINE</div>
-        <h2>Log a dose</h2>
-        <p>Record what was actually given. Exact product and dose timing help spot patterns without guessing cause.</p>
-        <form method="post" action="/medications" class="tracker-form">
-          <input type="hidden" name="pet_id" value="{{ pet.id }}">
-          <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="Medication name"></label>
-          <label>Active ingredient<input maxlength="120" name="active_ingredient" placeholder="Active ingredient"></label>
-          <label>Dose<input type="number" min="0" step="0.001" name="dose_value" placeholder="16"></label>
-          <label>Unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
-          <label>Route<select name="route"><option value="">Not recorded</option><option>by mouth</option><option>injection</option><option>topical</option><option>other</option></select></label>
-          <label>Status<select name="status"><option value="given">Given</option><option value="missed">Missed</option><option value="extra">Extra dose</option><option value="vomited_back">Vomited back</option></select></label>
-          <label class="full-width">Note <span class="field-hint">optional</span><input maxlength="500" name="note" placeholder="With food"></label>
-          <button class="button secondary full-width" type="submit">Save dose with current time</button>
-        </form>
-        {% if medications.is_empty() %}<p class="tracker-empty">No medication exposures recorded yet.</p>{% else %}<div class="medication-list">{% for medication in medications %}<div class="medication-row"><strong>{{ medication.name }}</strong><span>{{ medication.administered_at.format("%d %b, %H:%M") }}{% match medication.dose_value %}{% when Some with (dose) %}<small>{{ dose }}{% match medication.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</small>{% when None %}{% endmatch %}</span></div>{% endfor %}</div>{% endif %}
-      </section>
-      <section class="tracker-box prescription-box">
-        <div class="side-label">CURRENT PRESCRIPTIONS</div>
-        <h2>Medication plan</h2>
-        <p>Keep the prescribed plan separate from what was actually taken. Record gaps as missed or partial doses so an agent or vet can see the difference.</p>
-        <form method="post" action="/prescriptions" class="tracker-form">
-          <input type="hidden" name="pet_id" value="{{ pet.id }}">
-          <label class="full-width">Medication<input required maxlength="120" name="name" placeholder="Medication name"></label>
-          <label>Active ingredient <span class="field-hint">optional</span><input maxlength="120" name="active_ingredient" placeholder="benazepril"></label>
-          <label>Strength / concentration <span class="field-hint">optional</span><input type="number" min="0" step="0.001" name="concentration_value" placeholder="20"></label>
-          <label>Strength unit<input maxlength="40" name="concentration_unit" placeholder="mg/ml"></label>
-          <label>Dose per time<input type="number" min="0" step="0.001" name="dose_value" placeholder="1"></label>
-          <label>Dose unit<input maxlength="30" name="dose_unit" placeholder="mg"></label>
-          <label>Frequency<input maxlength="80" name="frequency" placeholder="once daily"></label>
-          <label>Route<input maxlength="40" name="route" placeholder="by mouth"></label>
-          <label>Started <span class="field-hint">optional</span><input type="date" name="started_on"></label>
-          <label>Status<select name="status"><option value="active">Active</option><option value="paused">Paused</option><option value="stopped">Stopped</option></select></label>
-          <label class="full-width">Instructions / original wording<input maxlength="500" name="instructions" placeholder="Split into two halves and give with treats"></label>
-          <label class="full-width">Source note <span class="field-hint">optional</span><input maxlength="1000" name="raw_input" placeholder="What the vet or owner said"></label>
-          <button class="button secondary full-width" type="submit">Save prescription</button>
-        </form>
-        {% if prescriptions.is_empty() %}<p class="tracker-empty">No current prescriptions recorded yet.</p>{% else %}
-        <div class="prescription-list">{% for prescription in prescriptions %}<article class="prescription-row"><div><div class="prescription-title"><strong>{{ prescription.name }}</strong><span class="prescription-status {{ prescription.status }}">{{ prescription.status }}</span></div><p>{% match prescription.concentration_value %}{% when Some with (strength) %}{{ strength }}{% match prescription.concentration_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %} · {% when None %}{% endmatch %}{% match prescription.dose_value %}{% when Some with (dose) %}{{ dose }}{% match prescription.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}{% when None %}Dose not recorded{% endmatch %}{% match prescription.frequency %}{% when Some with (frequency) %} · {{ frequency }}{% when None %}{% endmatch %}</p>{% match prescription.instructions %}{% when Some with (instructions) %}<small>{{ instructions }}</small>{% when None %}{% endmatch %}</div></article>{% endfor %}</div>
-        <div class="adherence-capture"><div class="side-label">DOSE GAPS</div><h3>Record what happened</h3><form method="post" action="/medication-adherence" class="tracker-form"><input type="hidden" name="pet_id" value="{{ pet.id }}"><label>Prescription<select required name="prescription_id">{% for prescription in prescriptions %}<option value="{{ prescription.id }}">{{ prescription.name }}</option>{% endfor %}</select></label><label>Date<input required type="date" name="scheduled_for"></label><label>Status<select required name="status"><option value="partial">Partial dose</option><option value="missed">Missed / not eaten</option><option value="given">Taken as prescribed</option><option value="unknown">Not sure</option></select></label><label>Actual dose <span class="field-hint">optional</span><input type="number" min="0" step="0.001" name="actual_dose_value" placeholder="0.5"></label><label>Unit <span class="field-hint">optional</span><input maxlength="30" name="actual_dose_unit" placeholder="mg"></label><label class="full-width">Why / note <span class="field-hint">optional</span><input maxlength="500" name="reason" placeholder="Only part of the dose was taken"></label><label class="full-width">Original wording <span class="field-hint">optional</span><input maxlength="1000" name="raw_input" placeholder="Milo only took part of the dose"></label><button class="button secondary full-width" type="submit">Save dose status</button></form></div>
-        {% if adherence.is_empty() %}<p class="tracker-empty">No dose gaps recorded yet.</p>{% else %}<div class="adherence-list">{% for dose in adherence %}<div class="adherence-row"><div><strong>{{ dose.prescription_name }}</strong><span>{{ dose.scheduled_for }}</span></div><div class="adherence-status {{ dose.status }}">{{ dose.status }}</div><div>{% match dose.actual_dose_value %}{% when Some with (actual) %}{{ actual }}{% match dose.actual_dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}{% when None %}—{% endmatch %}</div>{% match dose.reason %}{% when Some with (reason) %}<small>{{ reason }}</small>{% when None %}{% endmatch %}</div>{% endfor %}</div>{% endif %}
-        {% endif %}
-      </section>
-      <section class="tracker-box lab-box">
-        <div class="side-label">BLOOD TESTS</div>
-        <h2>Bring in a lab report</h2>
-        <p>Upload a PDF or image here. Each household gets its own private storage area. Spanish and English reports are supported.</p>
-        <form method="post" action="/blood-tests/upload" enctype="multipart/form-data" class="tracker-form">
-          <label class="full-width">Lab report<input required type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.avif,application/pdf,image/*"></label>
-          <button class="button secondary full-width" type="submit">Upload and import</button>
-        </form>
-        <form method="post" action="/blood-tests/import"><button class="button secondary" type="submit">Import new tests</button></form>
-        {% if lab_reports.is_empty() %}<p class="tracker-empty">No blood tests imported yet.</p>{% else %}
-        <section class="lab-trends" data-lab-trends data-pet-name="{{ pet.name }}">
-          <div class="lab-trends-head"><div><div class="side-label">TRENDS / ALL MARKERS</div><h3>Values over time</h3></div><div class="trend-head-actions"><span class="trend-pulse" aria-hidden="true"></span><button class="trend-expand" type="button" data-trend-expand aria-expanded="false">Open full view</button></div></div>
-          <p class="trend-intro">Every marker is shown together in its own scale, so changes stay readable. This is a record of results, not a diagnosis.</p>
-          <div class="trend-controls"><div class="trend-scope"><span>VISIBLE NOW</span><strong data-trend-count>—</strong></div><div class="trend-summary" data-trend-summary aria-live="polite"></div></div>
-          <div class="trend-chart" data-trend-chart aria-label="Blood-test trend chart"></div>
-          <div class="trend-table-wrap"><table class="trend-table"><caption class="sr-only">All blood-test values over time</caption><thead><tr><th>Marker</th><th>Date</th><th>Value</th><th>Reference</th></tr></thead><tbody data-trend-table></tbody></table></div>
-          <div class="trend-points" aria-hidden="true">
-            {% for report in lab_reports %}{% match report.test_date %}{% when Some with (date) %}{% for result in report.results %}{% match result.value_numeric %}{% when Some with (value) %}<span data-lab-point data-test="{{ result.test_name }}" data-date="{{ date }}" data-value="{{ value }}" data-unit="{% match result.unit %}{% when Some with (unit) %}{{ unit }}{% when None %}{% endmatch %}" data-reference="{% match result.reference_range %}{% when Some with (range) %}{{ range }}{% when None %}{% endmatch %}" data-flag="{% match result.flag %}{% when Some with (flag) %}{{ flag }}{% when None %}{% endmatch %}"></span>{% when None %}{% endmatch %}{% endfor %}{% when None %}{% endmatch %}{% endfor %}
-          </div>
-        </section>
-        <div class="lab-list">{% for report in lab_reports %}<details class="lab-report"><summary class="lab-report-summary"><span><strong>{{ report.test_date.as_deref().unwrap_or("Date not found") }}</strong><small>{{ report.source_filename }}</small></span><em>{{ report.results.len() }} values</em></summary><div class="lab-report-body">{% if report.results.is_empty() %}<p>Text saved, but no result rows were recognized yet.</p>{% else %}<div class="lab-results">{% for result in report.results %}<div><span>{{ result.test_name }}</span><strong>{{ result.value_text }}{% match result.unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</strong>{% match result.flag %}{% when Some with (flag) %}<b>{{ flag }}</b>{% when None %}{% endmatch %}</div>{% endfor %}</div>{% endif %}<details class="ocr-details"><summary>Show extracted text</summary><pre>{{ report.raw_text }}</pre></details></div></details>{% endfor %}</div>
-        {% endif %}
-      </section>
-      {% when None %}{% endmatch %}
-    </aside>
   </div>
 </body>
 </html>

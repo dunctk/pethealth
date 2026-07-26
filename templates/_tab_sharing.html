@@ -1,0 +1,13 @@
+<section class="sharing-tab">
+  <section class="share-box">
+    <div class="side-label">SHARE WITH YOUR VET</div>
+    <h2>Share {{ pet.name }}'s history</h2>
+    <p>Create a link your vet can view. It expires automatically.</p>
+    <form hx-post="/shares" hx-target="#shares-region" hx-swap="outerHTML" class="share-form">
+      <input type="hidden" name="pet_id" value="{{ pet.id }}"><label>Vet or clinic<input required maxlength="120" name="label" placeholder="Dr. Ruiz"></label>
+      <label>Expires<select name="days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label>
+      <button class="button secondary" type="submit">Create vet link</button>
+    </form>
+    {% include "_shares.html" %}
+  </section>
+</section>

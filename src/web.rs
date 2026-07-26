@@ -23,6 +23,7 @@ const CSS: &str = include_str!("../static/app.css");
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/app", get(index))
+        .route("/app/tab/{view}", get(tab_fragment))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
         .route("/symptoms", post(create_symptom))
@@ -261,6 +262,129 @@ async fn change_password(
 #[derive(Deserialize, Default)]
 struct IndexQuery {
     pet: Option<i64>,
+    view: Option<String>,
+}
+
+/// Which tab of the console is showing. Phase 1 only: each tab is rendered from
+/// its own template struct carrying only the data that tab needs, so `index`
+/// stops running all nine queries on every load. See `UI_REDESIGN_PLAN.md` §4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleView {
+    Timeline,
+    Plan,
+    Labs,
+    Sharing,
+}
+
+impl ConsoleView {
+    /// Unknown or missing values fall back to the timeline rather than erroring.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("plan") => Self::Plan,
+            Some("labs") => Self::Labs,
+            Some("sharing") => Self::Sharing,
+            _ => Self::Timeline,
+        }
+    }
+    fn is_timeline(self) -> bool {
+        self == Self::Timeline
+    }
+    fn is_plan(self) -> bool {
+        self == Self::Plan
+    }
+    fn is_labs(self) -> bool {
+        self == Self::Labs
+    }
+    fn is_sharing(self) -> bool {
+        self == Self::Sharing
+    }
+}
+
+/// Data shared across the pet-header metrics strip and, when the matching tab is
+/// selected, reused directly by that tab instead of being queried twice.
+struct ConsoleData {
+    events: Vec<HealthEvent>,
+    weights: Vec<WeightEntry>,
+    shares: Vec<ShareGrant>,
+    prescriptions: Vec<MedicationPrescription>,
+}
+
+async fn load_console_data(
+    state: &AppState,
+    household_id: i64,
+    pet_id: i64,
+) -> Result<ConsoleData, AppError> {
+    let events = db::list_events(&state.db, household_id, Some(pet_id), 50).await?;
+    let weights = db::list_weights(&state.db, household_id, pet_id).await?;
+    let shares = db::list_shares(&state.db, household_id).await?;
+    let prescriptions = db::list_prescriptions(&state.db, household_id, pet_id, 20).await?;
+    Ok(ConsoleData {
+        events,
+        weights,
+        shares,
+        prescriptions,
+    })
+}
+
+/// Runs only the extra queries the selected tab needs on top of `ConsoleData`
+/// (already loaded for the pet-header metrics strip) and renders that tab's
+/// fragment to a string. Used both by the full `/app` page load and by the
+/// `/app/tab/{view}` HTMX fragment route, so a full page load and an in-app tab
+/// switch always agree on markup.
+async fn render_tab_from_data(
+    state: &AppState,
+    household_id: i64,
+    pet: &Pet,
+    view: ConsoleView,
+    data: ConsoleData,
+) -> Result<String, AppError> {
+    let html = match view {
+        ConsoleView::Timeline => {
+            let knowledge = knowledge_for_events(state, &data.events).await?;
+            let related_count = match data.events.first() {
+                Some(event) => {
+                    db::count_related(&state.db, household_id, pet.id, &event.concept).await?
+                }
+                None => 0,
+            };
+            TabTimelineTemplate {
+                selected_pet: Some(pet.clone()),
+                events: data.events,
+                knowledge,
+                related_count,
+                capture_message: None,
+                capture_error: None,
+            }
+            .render()?
+        }
+        ConsoleView::Plan => {
+            let adherence = db::list_adherence(&state.db, household_id, pet.id, 30).await?;
+            let medications = db::list_medications(&state.db, household_id, pet.id, 20).await?;
+            TabPlanTemplate {
+                pet: pet.clone(),
+                prescriptions: data.prescriptions,
+                adherence,
+                medications,
+                weights: data.weights,
+            }
+            .render()?
+        }
+        ConsoleView::Labs => {
+            let lab_reports = db::list_lab_reports(&state.db, household_id, pet.id).await?;
+            TabLabsTemplate {
+                pet: pet.clone(),
+                lab_reports,
+            }
+            .render()?
+        }
+        ConsoleView::Sharing => TabSharingTemplate {
+            pet: pet.clone(),
+            shares: data.shares,
+            new_share_path: None,
+        }
+        .render()?,
+    };
+    Ok(html)
 }
 
 async fn index(
@@ -273,57 +397,55 @@ async fn index(
         Some(id) => db::get_pet(&state.db, user.household_id, id).await?,
         None => None,
     };
-    let events = db::list_events(
-        &state.db,
-        user.household_id,
-        selected_pet.as_ref().map(|pet| pet.id),
-        50,
-    )
-    .await?;
-    let knowledge = knowledge_for_events(&state, &events).await?;
-    let related_count = if let (Some(pet), Some(event)) = (&selected_pet, events.first()) {
-        db::count_related(&state.db, user.household_id, pet.id, &event.concept).await?
-    } else {
-        0
-    };
-    let shares = db::list_shares(&state.db, user.household_id).await?;
-    let weights = match &selected_pet {
-        Some(pet) => db::list_weights(&state.db, user.household_id, pet.id).await?,
-        None => Vec::new(),
-    };
-    let lab_reports = match &selected_pet {
-        Some(pet) => db::list_lab_reports(&state.db, user.household_id, pet.id).await?,
-        None => Vec::new(),
-    };
-    let medications = match &selected_pet {
-        Some(pet) => db::list_medications(&state.db, user.household_id, pet.id, 20).await?,
-        None => Vec::new(),
-    };
-    let prescriptions = match &selected_pet {
-        Some(pet) => db::list_prescriptions(&state.db, user.household_id, pet.id, 20).await?,
-        None => Vec::new(),
-    };
-    let adherence = match &selected_pet {
-        Some(pet) => db::list_adherence(&state.db, user.household_id, pet.id, 30).await?,
-        None => Vec::new(),
-    };
+    let view = ConsoleView::parse(query.view.as_deref());
+    let mut tab_html = String::new();
+    let mut events_count = 0;
+    let mut latest_weight = None;
+    let mut shares_count = 0;
+    let mut active_prescription_count = 0;
+    if let Some(pet) = &selected_pet {
+        let data = load_console_data(&state, user.household_id, pet.id).await?;
+        events_count = data.events.len();
+        latest_weight = data.weights.first().cloned();
+        shares_count = data.shares.len();
+        active_prescription_count = data
+            .prescriptions
+            .iter()
+            .filter(|item| item.status == "active")
+            .count();
+        tab_html = render_tab_from_data(&state, user.household_id, pet, view, data).await?;
+    }
     render(&ConsoleTemplate {
         user,
         pets,
         selected_pet,
-        events,
-        knowledge,
-        related_count,
-        shares,
-        weights,
-        lab_reports,
-        medications,
-        prescriptions,
-        adherence,
-        new_share_path: None,
-        capture_message: None,
-        capture_error: None,
+        view,
+        tab_html,
+        events_count,
+        latest_weight,
+        shares_count,
+        active_prescription_count,
     })
+}
+
+/// `GET /app/tab/{view}` — the HTMX fragment counterpart of `index`. Returns just
+/// the tab body so switching tabs is a bounded swap, not a full page reload.
+/// Household-scoped via `db::get_pet(household_id, pet_id)`: the pet id from the
+/// query string is never trusted without that check.
+async fn tab_fragment(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Path(view): Path<String>,
+    Query(query): Query<IndexQuery>,
+) -> Result<Html<String>, AppError> {
+    let pet_id = query.pet.ok_or_else(AppError::not_found)?;
+    let pet = db::get_pet(&state.db, user.household_id, pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let view = ConsoleView::parse(Some(&view));
+    let data = load_console_data(&state, user.household_id, pet.id).await?;
+    let html = render_tab_from_data(&state, user.household_id, &pet, view, data).await?;
+    Ok(Html(html))
 }
 
 #[derive(Deserialize)]
@@ -1100,18 +1222,52 @@ struct ConsoleTemplate {
     user: UserAccount,
     pets: Vec<Pet>,
     selected_pet: Option<Pet>,
+    view: ConsoleView,
+    /// The selected tab, pre-rendered from its own template struct (see
+    /// `render_tab_from_data`) and injected here with `|safe`. Not an
+    /// `{% include %}`: an include would inherit this struct's fields, forcing
+    /// `ConsoleTemplate` to keep carrying every tab's data on every load.
+    tab_html: String,
+    events_count: usize,
+    latest_weight: Option<WeightEntry>,
+    shares_count: usize,
+    active_prescription_count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "_tab_timeline.html")]
+struct TabTimelineTemplate {
+    selected_pet: Option<Pet>,
     events: Vec<HealthEvent>,
     knowledge: Option<KnowledgeArticle>,
     related_count: u64,
-    shares: Vec<ShareGrant>,
-    weights: Vec<WeightEntry>,
-    lab_reports: Vec<LabReport>,
-    medications: Vec<MedicationAdministration>,
-    prescriptions: Vec<MedicationPrescription>,
-    adherence: Vec<MedicationAdherence>,
-    new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "_tab_plan.html")]
+struct TabPlanTemplate {
+    pet: Pet,
+    prescriptions: Vec<MedicationPrescription>,
+    adherence: Vec<MedicationAdherence>,
+    medications: Vec<MedicationAdministration>,
+    weights: Vec<WeightEntry>,
+}
+
+#[derive(Template)]
+#[template(path = "_tab_labs.html")]
+struct TabLabsTemplate {
+    pet: Pet,
+    lab_reports: Vec<LabReport>,
+}
+
+#[derive(Template)]
+#[template(path = "_tab_sharing.html")]
+struct TabSharingTemplate {
+    pet: Pet,
+    shares: Vec<ShareGrant>,
+    new_share_path: Option<String>,
 }
 
 #[derive(Template)]

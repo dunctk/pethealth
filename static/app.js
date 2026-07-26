@@ -152,3 +152,24 @@ function initAllLabTrends() {
 
 document.addEventListener("DOMContentLoaded", initAllLabTrends);
 document.addEventListener("htmx:afterSwap", initAllLabTrends);
+
+// The console tab bar (`.tab-bar`) sits outside the `#tab-body` fragment that
+// `GET /app/tab/{view}` swaps in, so switching tabs would otherwise leave the
+// old tab marked active. Re-derive the active tab from the request path that
+// was actually fetched, rather than from location/history timing.
+function highlightActiveTab(requestPath) {
+  const match = /\/app\/tab\/([a-z]+)/.exec(requestPath || "");
+  if (!match) return;
+  document.querySelectorAll(".tab-bar .tab-link").forEach((link) => {
+    const isActive = new URL(link.href, window.location.origin).searchParams.get("view") === match[1];
+    link.classList.toggle("active", isActive);
+    if (isActive) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
+}
+
+document.addEventListener("htmx:afterSwap", (event) => {
+  if (event.target && event.target.id === "tab-body") {
+    highlightActiveTab(event.detail && event.detail.pathInfo && event.detail.pathInfo.requestPath);
+  }
+});

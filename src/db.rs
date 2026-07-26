@@ -3,7 +3,8 @@ use crate::{
     domain::{
         ClinicalTimeline, DEFAULT_HOUSEHOLD_ID, HealthEvent, KnowledgeArticle, MedicationAdherence,
         MedicationAdministration, MedicationPlan, MedicationPrescription, Pet, ProposedEvent,
-        ShareGrant, SymptomObservation, TemporalLink, UserAccount, event_presentation,
+        ShareGrant, SymptomObservation, TemporalLink, TimelineEntry, UserAccount,
+        event_presentation, lab_effective_at,
     },
 };
 use anyhow::{Context, anyhow};
@@ -918,20 +919,7 @@ pub async fn list_weights(
         "SELECT id,pet_id,weight_kg,measured_at,note FROM weight_entries WHERE household_id=? AND pet_id=? ORDER BY measured_at DESC LIMIT 100",
         [household_id.into(), pet_id.into()],
     )).await?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(crate::domain::WeightEntry {
-                id: row.try_get("", "id")?,
-                pet_id: row.try_get("", "pet_id")?,
-                weight_kg: row.try_get("", "weight_kg")?,
-                measured_at: row
-                    .try_get::<String>("", "measured_at")?
-                    .parse()
-                    .context("invalid weight timestamp")?,
-                note: row.try_get("", "note")?,
-            })
-        })
-        .collect()
+    rows.into_iter().map(weight_from_row).collect()
 }
 
 pub async fn report_hash_exists(
@@ -1542,6 +1530,194 @@ pub async fn count_related(
     Ok(count as u64)
 }
 
+/// The merged, paginated timeline behind the Timeline tab (`UI_REDESIGN_PLAN.md`
+/// §4 Phase 2). Reads a bounded page from each of the four source tables — never
+/// writes to `health_events` on their behalf — and merges them in memory rather
+/// than backfilling or a wide SQL `UNION`, so `count_related` and the MCP tools
+/// (`clinical_timeline`, `medication_plan`) are untouched and cannot double-count.
+///
+/// `before` is a keyset cursor: `(occurred_at, id)` of the last entry already
+/// shown. Every arm is scoped by `household_id` *and* `pet_id` — the easiest
+/// place to leak another household's rows is forgetting that on one arm of a
+/// union (`UI_REDESIGN_PLAN.md` §6) — and `health_events` additionally keeps the
+/// existing `status='active'` filter so undone events never resurface here.
+///
+/// Correctness of the merge relies on a standard federated top-k bound: fetching
+/// the top `limit` rows (by `(sort_key, id)` descending, keyset-filtered by
+/// `before`) from each source is sufficient to guarantee the *merged* top `limit`
+/// is correct, because the union's Nth-ranked item can only ever come from among
+/// the first N items of whichever single source it belongs to. `lab_reports` is
+/// the one exception: `list_lab_reports` doesn't take a cursor (it's capped at 50
+/// reports per pet, an existing limit), so lab rows are filtered against `before`
+/// in Rust after fetching. That is fine at this app's realistic per-pet report
+/// volume, but means a pet with more than 50 lab reports could see older ones
+/// vanish from pagination — worth revisiting if that ever stops being true.
+pub async fn list_timeline(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    before: Option<(DateTime<Utc>, i64)>,
+    limit: u64,
+) -> anyhow::Result<Vec<TimelineEntry>> {
+    let events = timeline_events_page(db, household_id, pet_id, before, limit).await?;
+    let weights = timeline_weights_page(db, household_id, pet_id, before, limit).await?;
+    let doses = timeline_doses_page(db, household_id, pet_id, before, limit).await?;
+    let labs = list_lab_reports(db, household_id, pet_id).await?;
+
+    let mut merged: Vec<TimelineEntry> =
+        Vec::with_capacity(events.len() + weights.len() + doses.len() + labs.len());
+    merged.extend(events.into_iter().map(TimelineEntry::Event));
+    merged.extend(weights.into_iter().map(TimelineEntry::Weight));
+    merged.extend(doses.into_iter().map(TimelineEntry::Dose));
+    merged.extend(
+        labs.into_iter()
+            .filter(|report| {
+                before.is_none_or(|cursor| (lab_effective_at(report), report.id) < cursor)
+            })
+            .map(TimelineEntry::Lab),
+    );
+
+    merged.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
+    merged.truncate(limit as usize);
+    Ok(merged)
+}
+
+/// A page of `health_events`, matching `list_events`'s column set and `status`
+/// filter but with a keyset cursor on `(occurred_at, id)`. Kept private and
+/// separate from `list_events` so that function's signature and behaviour (used
+/// by the MCP tools) stay byte-for-byte unchanged.
+///
+/// The `datetime(...)` wrapping on both sides of every timestamp comparison
+/// normalises across the two RFC3339 spellings this codebase's own timestamps
+/// can carry — `+00:00` (everything written via `DateTime::to_rfc3339`) and `Z`
+/// (the bare-date branch in `web::create_weight`) — which otherwise compare
+/// unequal as raw strings for the same instant and would let a tied row silently
+/// vanish between pages instead of being included exactly once.
+async fn timeline_events_page(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    before: Option<(DateTime<Utc>, i64)>,
+    limit: u64,
+) -> anyhow::Result<Vec<HealthEvent>> {
+    let base = r#"SELECT e.*,p.name AS pet_name,
+        s.episode_id AS symptom_episode_id,s.symptom AS symptom_kind,s.occurrence_count AS symptom_occurrence_count,
+        s.amount AS symptom_amount,s.contents AS symptom_contents,s.meal_relation AS symptom_meal_relation,
+        s.water_status AS symptom_water_status,s.appetite_status AS symptom_appetite_status,
+        s.energy_status AS symptom_energy_status,s.pain_status AS symptom_pain_status,s.note AS symptom_note
+        FROM health_events e JOIN pets p ON p.id=e.pet_id LEFT JOIN symptom_observations s ON s.event_id=e.id
+        WHERE e.household_id=? AND e.pet_id=? AND e.status='active'"#;
+    let (sql, values) = match before {
+        Some((at, id)) => (
+            format!(
+                "{base} AND (datetime(e.occurred_at)<datetime(?) OR (datetime(e.occurred_at)=datetime(?) AND e.id<?)) \
+                 ORDER BY datetime(e.occurred_at) DESC, e.id DESC LIMIT ?"
+            ),
+            vec![
+                household_id.into(),
+                pet_id.into(),
+                at.to_rfc3339().into(),
+                at.to_rfc3339().into(),
+                id.into(),
+                limit.into(),
+            ],
+        ),
+        None => (
+            format!("{base} ORDER BY datetime(e.occurred_at) DESC, e.id DESC LIMIT ?"),
+            vec![household_id.into(), pet_id.into(), limit.into()],
+        ),
+    };
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await?;
+    rows.into_iter().map(event_from_row).collect()
+}
+
+/// A page of `weight_entries` with a keyset cursor. See `timeline_events_page`
+/// for why timestamps are compared through `datetime(...)`.
+async fn timeline_weights_page(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    before: Option<(DateTime<Utc>, i64)>,
+    limit: u64,
+) -> anyhow::Result<Vec<crate::domain::WeightEntry>> {
+    let base = "SELECT id,pet_id,weight_kg,measured_at,note FROM weight_entries WHERE household_id=? AND pet_id=?";
+    let (sql, values) = match before {
+        Some((at, id)) => (
+            format!(
+                "{base} AND (datetime(measured_at)<datetime(?) OR (datetime(measured_at)=datetime(?) AND id<?)) \
+                 ORDER BY datetime(measured_at) DESC, id DESC LIMIT ?"
+            ),
+            vec![
+                household_id.into(),
+                pet_id.into(),
+                at.to_rfc3339().into(),
+                at.to_rfc3339().into(),
+                id.into(),
+                limit.into(),
+            ],
+        ),
+        None => (
+            format!("{base} ORDER BY datetime(measured_at) DESC, id DESC LIMIT ?"),
+            vec![household_id.into(), pet_id.into(), limit.into()],
+        ),
+    };
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await?;
+    rows.into_iter().map(weight_from_row).collect()
+}
+
+/// A page of `medication_administrations` with a keyset cursor. See
+/// `timeline_events_page` for why timestamps are compared through `datetime(...)`.
+async fn timeline_doses_page(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    before: Option<(DateTime<Utc>, i64)>,
+    limit: u64,
+) -> anyhow::Result<Vec<MedicationAdministration>> {
+    let base = "SELECT m.*,p.name AS pet_name FROM medication_administrations m \
+        JOIN pets p ON p.id=m.pet_id WHERE m.household_id=? AND m.pet_id=?";
+    let (sql, values) = match before {
+        Some((at, id)) => (
+            format!(
+                "{base} AND (datetime(m.administered_at)<datetime(?) OR (datetime(m.administered_at)=datetime(?) AND m.id<?)) \
+                 ORDER BY datetime(m.administered_at) DESC, m.id DESC LIMIT ?"
+            ),
+            vec![
+                household_id.into(),
+                pet_id.into(),
+                at.to_rfc3339().into(),
+                at.to_rfc3339().into(),
+                id.into(),
+                limit.into(),
+            ],
+        ),
+        None => (
+            format!("{base} ORDER BY datetime(m.administered_at) DESC, m.id DESC LIMIT ?"),
+            vec![household_id.into(), pet_id.into(), limit.into()],
+        ),
+    };
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await?;
+    rows.into_iter().map(medication_from_row).collect()
+}
+
 pub async fn get_knowledge(
     db: &DatabaseConnection,
     concept: &str,
@@ -1767,6 +1943,19 @@ fn event_from_row(row: QueryResult) -> anyhow::Result<HealthEvent> {
         icon,
         tone,
         symptom,
+    })
+}
+
+fn weight_from_row(row: QueryResult) -> anyhow::Result<crate::domain::WeightEntry> {
+    Ok(crate::domain::WeightEntry {
+        id: row.try_get("", "id")?,
+        pet_id: row.try_get("", "pet_id")?,
+        weight_kg: row.try_get("", "weight_kg")?,
+        measured_at: row
+            .try_get::<String>("", "measured_at")?
+            .parse()
+            .context("invalid weight timestamp")?,
+        note: row.try_get("", "note")?,
     })
 }
 
@@ -2114,5 +2303,380 @@ mod tests {
         let second_token = create_session(&db, alice.id).await.unwrap();
         revoke_session(&db, &second_token).await.unwrap();
         assert!(resolve_session(&db, &second_token).await.unwrap().is_none());
+    }
+
+    fn timeline_entry_id(entry: &TimelineEntry) -> i64 {
+        match entry {
+            TimelineEntry::Event(event) => event.id,
+            TimelineEntry::Weight(weight) => weight.id,
+            TimelineEntry::Dose(dose) => dose.id,
+            TimelineEntry::Lab(lab) => lab.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_timeline_merges_all_sources_in_time_order() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+
+        // Four calendar days apart so the lab report's date-only (no time of
+        // day) sort key can't collide with the others' full timestamps.
+        let event_at = Utc::now() - Duration::days(4);
+        let weight_at = Utc::now() - Duration::days(3);
+        let dose_at = Utc::now() - Duration::days(2);
+        let lab_date = (Utc::now() - Duration::days(1)).date_naive().to_string();
+
+        let event_id = create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited",
+            event_at,
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+        let weight_id = create_weight(&db, 1, "user:1", pet_id, 4.8, &weight_at.to_rfc3339(), None)
+            .await
+            .unwrap();
+        let dose_id = create_medication_administration(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Benazepril",
+            None,
+            Some(1.0),
+            Some("mg"),
+            Some("oral"),
+            dose_at,
+            None,
+            "given",
+            Some("Gave benazepril"),
+        )
+        .await
+        .unwrap();
+        let lab_id = create_lab_report(
+            &db,
+            1,
+            "user:1",
+            pet_id,
+            "panel.pdf",
+            "hash-1",
+            "raw ocr text",
+            Some(&lab_date),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let entries = list_timeline(&db, 1, pet_id, None, 20).await.unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(&entries[0], TimelineEntry::Lab(lab) if lab.id == lab_id));
+        assert!(matches!(&entries[1], TimelineEntry::Dose(dose) if dose.id == dose_id));
+        assert!(matches!(&entries[2], TimelineEntry::Weight(weight) if weight.id == weight_id));
+        assert!(matches!(&entries[3], TimelineEntry::Event(event) if event.id == event_id));
+    }
+
+    #[tokio::test]
+    async fn list_timeline_never_leaks_another_households_rows() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited",
+            Utc::now(),
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+        create_weight(
+            &db,
+            1,
+            "user:1",
+            pet_id,
+            4.8,
+            &Utc::now().to_rfc3339(),
+            None,
+        )
+        .await
+        .unwrap();
+        create_medication_administration(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Benazepril",
+            None,
+            Some(1.0),
+            Some("mg"),
+            Some("oral"),
+            Utc::now(),
+            None,
+            "given",
+            None,
+        )
+        .await
+        .unwrap();
+        create_lab_report(
+            &db,
+            1,
+            "user:1",
+            pet_id,
+            "panel.pdf",
+            "hash-1",
+            "raw ocr text",
+            Some("2026-01-01"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // A second, genuinely separate household (`households` has a foreign key
+        // households(id), so this must be a real row, not a bare literal `2`).
+        let other_household = create_account(&db, "other@example.com", "Other Owner", "hash")
+            .await
+            .unwrap();
+        let other_household_id = other_household.household_id;
+        let other_pet_id = create_pet(&db, other_household_id, "user:2", "Nala", "Dog", None, None)
+            .await
+            .unwrap();
+        let other_pet = get_pet(&db, other_household_id, other_pet_id)
+            .await
+            .unwrap()
+            .unwrap();
+        create_symptom_event(
+            &db,
+            other_household_id,
+            "user:2",
+            &other_pet,
+            "Nala scratched",
+            Utc::now(),
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+        create_weight(
+            &db,
+            other_household_id,
+            "user:2",
+            other_pet_id,
+            9.0,
+            &Utc::now().to_rfc3339(),
+            None,
+        )
+        .await
+        .unwrap();
+        create_medication_administration(
+            &db,
+            other_household_id,
+            "user:2",
+            &other_pet,
+            "Other medicine",
+            None,
+            Some(2.0),
+            Some("mg"),
+            Some("oral"),
+            Utc::now(),
+            None,
+            "given",
+            None,
+        )
+        .await
+        .unwrap();
+        create_lab_report(
+            &db,
+            other_household_id,
+            "user:2",
+            other_pet_id,
+            "other.pdf",
+            "hash-2",
+            "raw ocr text",
+            Some("2026-01-01"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            list_timeline(&db, 1, pet_id, None, 20).await.unwrap().len(),
+            4
+        );
+        assert_eq!(
+            list_timeline(&db, other_household_id, other_pet_id, None, 20)
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        // Household 1 asking about the other household's pet id must come back
+        // empty, not fall through to an unscoped match.
+        assert!(
+            list_timeline(&db, 1, other_pet_id, None, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_timeline(&db, other_household_id, pet_id, None, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_timeline_keyset_pagination_handles_ties_without_skip_or_duplicate() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        let tied_at = Utc::now() - Duration::days(1);
+        // Two weight entries sharing the exact same measured_at timestamp.
+        let w1 = create_weight(&db, 1, "user:1", pet_id, 4.7, &tied_at.to_rfc3339(), None)
+            .await
+            .unwrap();
+        let w2 = create_weight(&db, 1, "user:1", pet_id, 4.8, &tied_at.to_rfc3339(), None)
+            .await
+            .unwrap();
+        let event_id = create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited",
+            Utc::now(),
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+
+        let page1 = list_timeline(&db, 1, pet_id, None, 2).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().unwrap().sort_key();
+        let page2 = list_timeline(&db, 1, pet_id, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+
+        let mut seen_ids: Vec<i64> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(timeline_entry_id)
+            .collect();
+        seen_ids.sort_unstable();
+        let mut expected = vec![event_id, w1, w2];
+        expected.sort_unstable();
+        assert_eq!(seen_ids, expected);
+
+        // A third page beyond the data returns nothing, not a repeat.
+        let cursor2 = page2.last().unwrap().sort_key();
+        assert!(
+            list_timeline(&db, 1, pet_id, Some(cursor2), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_timeline_excludes_undone_events() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        let event_id = create_symptom_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Milo vomited",
+            Utc::now(),
+            "vomiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "owner_form",
+        )
+        .await
+        .unwrap();
+        let weight_id = create_weight(
+            &db,
+            1,
+            "user:1",
+            pet_id,
+            4.8,
+            &Utc::now().to_rfc3339(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            list_timeline(&db, 1, pet_id, None, 20).await.unwrap().len(),
+            2
+        );
+        assert!(undo_event(&db, 1, "user:1", event_id).await.unwrap());
+        let entries = list_timeline(&db, 1, pet_id, None, 20).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], TimelineEntry::Weight(weight) if weight.id == weight_id));
     }
 }

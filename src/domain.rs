@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HOUSEHOLD_ID: i64 = 1;
@@ -206,6 +206,54 @@ pub struct ProposedEvent {
     pub summary: String,
     pub details: Option<String>,
     pub minutes_ago: Option<i64>,
+}
+
+/// One entry on the unified per-pet timeline (`db::list_timeline`). Phase 2 of
+/// `UI_REDESIGN_PLAN.md` merges four previously-separate logs — health events,
+/// weight entries, medication administrations ("doses"), and lab reports — into
+/// one chronological record, rendered differently by type. This is a read-time
+/// `UNION`, not backfilled `health_events` rows: nothing is written to
+/// `health_events` on behalf of the other three sources.
+#[derive(Clone, Debug, Serialize)]
+pub enum TimelineEntry {
+    Event(HealthEvent),
+    Weight(WeightEntry),
+    Dose(MedicationAdministration),
+    Lab(LabReport),
+}
+
+impl TimelineEntry {
+    /// The `(timestamp, id)` pair the merged timeline sorts and paginates on.
+    /// Descending on this tuple is the timeline order; the keyset cursor for
+    /// "Load older" is exactly this pair taken from the last entry on a page.
+    pub fn sort_key(&self) -> (DateTime<Utc>, i64) {
+        match self {
+            TimelineEntry::Event(event) => (event.occurred_at, event.id),
+            TimelineEntry::Weight(weight) => (weight.measured_at, weight.id),
+            TimelineEntry::Dose(dose) => (dose.administered_at, dose.id),
+            TimelineEntry::Lab(lab) => (lab_effective_at(lab), lab.id),
+        }
+    }
+}
+
+/// A lab report's effective timeline timestamp. OCR'd reports carry a bare date
+/// in `test_date` (e.g. `"2026-1-5"` — not necessarily zero-padded, see
+/// `ocr::find_date`) rather than a timestamp, and may have no date at all if OCR
+/// could not find one. Parse `test_date` as a calendar date at midday UTC (matching
+/// the convention `web::create_weight` already uses for date-only input); if it is
+/// absent or fails to parse, fall back to `imported_at`, which the app always
+/// writes itself as a valid RFC3339 timestamp and so can never be missing or
+/// malformed. This never panics and never drops a row: a report with an
+/// unparseable `test_date` still lands on the timeline, just ordered by import
+/// time instead of test time.
+pub fn lab_effective_at(report: &LabReport) -> DateTime<Utc> {
+    report
+        .test_date
+        .as_deref()
+        .and_then(|raw| NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok())
+        .and_then(|date| date.and_hms_opt(12, 0, 0))
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        .unwrap_or(report.imported_at)
 }
 
 pub fn event_presentation(event_type: &str, concept: &str) -> (&'static str, &'static str) {

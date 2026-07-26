@@ -173,3 +173,52 @@ document.addEventListener("htmx:afterSwap", (event) => {
     highlightActiveTab(event.detail && event.detail.pathInfo && event.detail.pathInfo.requestPath);
   }
 });
+
+// The type filter chips (`All · Symptoms · Meds · Weight · Labs`) on the
+// Timeline tab are a client-side filter over already-rendered rows, per
+// UI_REDESIGN_PLAN.md §4 Phase 2: cheaper than a round trip, and the rows
+// already carry a `data-kind` attribute set server-side in
+// `_timeline_days.html`. Re-run on every htmx:afterSwap (capture, undo, tab
+// switch, and "Load older" all swap or append into this region) so a filter
+// the visitor already chose keeps applying to rows that arrive afterward,
+// instead of silently resetting or leaving new rows unfiltered.
+function applyTimelineFilter(region, filter) {
+  const entries = region.querySelector("#timeline-entries");
+  if (!entries) return;
+  [...entries.querySelectorAll(".event-row")].forEach((row) => {
+    row.hidden = filter !== "all" && row.dataset.kind !== filter;
+  });
+  // Hide a date header once every row under it (up to the next header) is hidden.
+  [...entries.querySelectorAll(".timeline-day")].forEach((day) => {
+    let node = day.nextElementSibling;
+    let anyVisible = false;
+    while (node && !node.classList.contains("timeline-day")) {
+      if (!node.hidden) anyVisible = true;
+      node = node.nextElementSibling;
+    }
+    day.hidden = !anyVisible;
+  });
+}
+
+function initTimelineFilters(region) {
+  const chips = [...region.querySelectorAll(".timeline-filters .chip")];
+  if (!chips.length) return;
+  if (!region.dataset.filterBound) {
+    region.dataset.filterBound = "true";
+    region.addEventListener("click", (event) => {
+      const chip = event.target.closest(".chip");
+      if (!chip || !region.contains(chip)) return;
+      chips.forEach((candidate) => candidate.classList.toggle("active", candidate === chip));
+      applyTimelineFilter(region, chip.dataset.filter);
+    });
+  }
+  const active = chips.find((chip) => chip.classList.contains("active"));
+  applyTimelineFilter(region, active ? active.dataset.filter : "all");
+}
+
+function initAllTimelineFilters() {
+  document.querySelectorAll("#timeline-region").forEach(initTimelineFilters);
+}
+
+document.addEventListener("DOMContentLoaded", initAllTimelineFilters);
+document.addEventListener("htmx:afterSwap", initAllTimelineFilters);

@@ -1,0 +1,55 @@
+{% for day in days %}
+{% match day.label %}
+{% when Some with (label) %}<div class="timeline-day"><span>── {{ label }} ──</span></div>
+{% when None %}{% endmatch %}
+{% for entry in day.entries %}
+{% match entry %}
+
+{% when TimelineEntry::Event with (event) %}
+<article class="event-row" data-kind="{{ event.event_type }}">
+  <div class="event-rail"><span class="event-icon {{ event.tone }}">{{ event.icon }}</span><i></i></div>
+  <div class="event-body">
+    <div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at.to_rfc3339() }}">{{ event.occurred_label }}</time></div>
+    <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>
+    {% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
+    {% match event.symptom %}
+    {% when Some with (symptom) %}
+    <div class="symptom-facts"><span class="fact-label">STRUCTURED FACTS</span>{% match symptom.occurrence_count %}{% when Some with (count) %}<span>{{ count }}×</span>{% when None %}{% endmatch %}{% match symptom.amount %}{% when Some with (amount) %}<span>{{ amount }}</span>{% when None %}{% endmatch %}{% match symptom.contents %}{% when Some with (contents) %}<span>{{ contents }}</span>{% when None %}{% endmatch %}{% match symptom.water_status %}{% when Some with (water) %}<span>{{ water }}</span>{% when None %}{% endmatch %}</div>
+    {% when None %}{% endmatch %}
+  </div>
+  <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
+</article>
+
+{% when TimelineEntry::Weight with (weight) %}
+<article class="event-row" data-kind="weight">
+  <div class="event-rail"><span class="event-icon active">⚖</span><i></i></div>
+  <div class="event-body">
+    <div class="event-meta"><span class="type active">weight</span><time datetime="{{ weight.measured_at.to_rfc3339() }}">{{ weight.measured_at.format("%H:%M") }}</time></div>
+    <h3>{{ weight.weight_kg }} kg</h3>
+    {% match weight.note %}{% when Some with (note) %}<p>“{{ note }}”</p>{% when None %}{% endmatch %}
+  </div>
+</article>
+
+{% when TimelineEntry::Dose with (dose) %}
+<article class="event-row" data-kind="medication">
+  <div class="event-rail"><span class="event-icon info">+</span><i></i></div>
+  <div class="event-body">
+    <div class="event-meta"><span class="type info">dose{% if dose.status != "given" %} · {{ dose.status }}{% endif %}</span><time datetime="{{ dose.administered_at.to_rfc3339() }}">{{ dose.administered_at.format("%H:%M") }}</time></div>
+    <h3>{{ dose.name }}{% match dose.dose_value %}{% when Some with (value) %} {{ value }}{% when None %}{% endmatch %}{% match dose.dose_unit %}{% when Some with (unit) %} {{ unit }}{% when None %}{% endmatch %}</h3>
+    {% match dose.raw_input %}{% when Some with (raw) %}<p>“{{ raw }}”</p>{% when None %}{% endmatch %}
+  </div>
+</article>
+
+{% when TimelineEntry::Lab with (lab) %}
+<article class="event-row" data-kind="lab">
+  <div class="event-rail"><span class="event-icon info">▤</span><i></i></div>
+  <div class="event-body">
+    <div class="event-meta"><span class="type info">lab</span><time>{% match lab.test_date %}{% when Some with (date) %}{{ date }}{% when None %}{{ lab.imported_at.format("%d %b %Y") }}{% endmatch %}</time></div>
+    <h3>{{ lab.source_filename }}</h3>
+    <p>{{ lab.results.len() }} result{% if lab.results.len() != 1 %}s{% endif %}</p>
+  </div>
+</article>
+
+{% endmatch %}
+{% endfor %}
+{% endfor %}

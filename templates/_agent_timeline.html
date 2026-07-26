@@ -30,22 +30,21 @@
   {% when None %}{% endmatch %}
 
   <section id="timeline-region" class="timeline-region" aria-live="polite">
-    <div class="section-head"><div><span class="eyebrow">HEALTH HISTORY</span><h2>Timeline</h2></div><span>{{ events.len() }} event{% if events.len() != 1 %}s{% endif %}</span></div>
-    {% if events.is_empty() %}
+    <div class="section-head"><div><span class="eyebrow">HEALTH HISTORY</span><h2>Timeline</h2></div><span>{{ entries_count }} entr{% if entries_count == 1 %}y{% else %}ies{% endif %}</span></div>
+    {% if days.is_empty() %}
       <div class="timeline-empty"><span>＋</span><h3>No events yet</h3><p>Use the box above to record what happened. We'll keep your original words with the date and time.</p></div>
     {% else %}
-      <div class="timeline">
-      {% for event in events %}
-        <article class="event-row">
-          <div class="event-rail"><span class="event-icon {{ event.tone }}">{{ event.icon }}</span><i></i></div>
-          <div class="event-body"><div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at }}">{{ event.occurred_label }}</time></div>
-            <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>{% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
-            {% match event.symptom %}{% when Some with (symptom) %}<div class="symptom-facts"><span class="fact-label">STRUCTURED FACTS</span>{% match symptom.occurrence_count %}{% when Some with (count) %}<span>{{ count }}×</span>{% when None %}{% endmatch %}{% match symptom.amount %}{% when Some with (amount) %}<span>{{ amount }}</span>{% when None %}{% endmatch %}{% match symptom.contents %}{% when Some with (contents) %}<span>{{ contents }}</span>{% when None %}{% endmatch %}{% match symptom.water_status %}{% when Some with (water) %}<span>{{ water }}</span>{% when None %}{% endmatch %}</div>{% when None %}{% endmatch %}
-          </div>
-          <form hx-post="/events/{{ event.id }}/undo?pet={{ event.pet_id }}" hx-target="#agent-and-timeline" hx-swap="outerHTML"><button class="quiet-action" type="submit">Undo</button></form>
-        </article>
-      {% endfor %}
+      <div class="timeline-filters" role="group" aria-label="Filter timeline by type">
+        <button type="button" class="chip active" data-filter="all">All</button>
+        <button type="button" class="chip" data-filter="symptom">Symptoms</button>
+        <button type="button" class="chip" data-filter="medication">Meds</button>
+        <button type="button" class="chip" data-filter="weight">Weight</button>
+        <button type="button" class="chip" data-filter="lab">Labs</button>
       </div>
+      <div class="timeline" id="timeline-entries">
+      {% include "_timeline_days.html" %}
+      </div>
+      {% include "_timeline_load_more.html" %}
     {% endif %}
   </section>
 </section>

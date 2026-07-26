@@ -1,0 +1,8 @@
+{% match next_cursor %}
+{% when Some with (cursor) %}
+<div id="timeline-load-more" class="timeline-more" hx-swap-oob="true">
+  <button class="quiet-action load-more" type="button" hx-get="/app/timeline/older?pet={{ pet_id }}&{{ cursor.query }}" hx-target="#timeline-entries" hx-swap="beforeend">Load older</button>
+</div>
+{% when None %}
+<div id="timeline-load-more" hx-swap-oob="true"></div>
+{% endmatch %}

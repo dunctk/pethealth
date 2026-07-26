@@ -2,7 +2,7 @@ use crate::{
     AppState, auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
-        MedicationPrescription, Pet, ShareGrant, UserAccount, WeightEntry,
+        MedicationPrescription, Pet, ShareGrant, TimelineEntry, UserAccount, WeightEntry,
     },
     ocr,
 };
@@ -15,7 +15,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 
 const CSS: &str = include_str!("../static/app.css");
@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/app", get(index))
         .route("/app/tab/{view}", get(tab_fragment))
+        .route("/app/timeline/older", get(timeline_older))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
         .route("/symptoms", post(create_symptom))
@@ -300,6 +301,94 @@ impl ConsoleView {
     }
 }
 
+/// How many timeline entries a page shows. `render_tab_from_data` and the
+/// `/app/timeline/older` fragment both request `TIMELINE_PAGE_SIZE + 1` from
+/// `db::list_timeline` and hand the result to `paginate_timeline`, which is the
+/// cheapest way to know whether a further page exists without guessing from a
+/// full page happening to come back exactly full.
+const TIMELINE_PAGE_SIZE: u64 = 20;
+
+/// One calendar-day group of the merged timeline (`UI_REDESIGN_PLAN.md` §3's
+/// `── 25 Jul ──` headers). `label` is `None` for a group that continues a day
+/// already headed on an earlier page — see `group_timeline_by_day` — so
+/// "Load older" never prints a duplicate date header for the day it split on.
+struct TimelineDay {
+    label: Option<String>,
+    entries: Vec<TimelineEntry>,
+}
+
+/// Keyset cursor for "Load older", pre-formatted as a ready-to-append,
+/// already-percent-encoded query string fragment so the template never touches
+/// a timestamp directly.
+struct TimelineCursor {
+    query: String,
+}
+
+impl TimelineCursor {
+    fn new((at, id): (DateTime<Utc>, i64)) -> Self {
+        Self {
+            query: format!(
+                "before_at={}&before_id={id}",
+                urlencoding::encode(&at.to_rfc3339())
+            ),
+        }
+    }
+}
+
+/// Splits a batch fetched as `TIMELINE_PAGE_SIZE + 1` rows into the page to
+/// display plus, if that extra row came back, the cursor for the next page.
+/// Fetching one row past the page size is enough to answer "is there more"
+/// exactly (see `db::list_timeline`'s doc comment on the federated top-k bound
+/// this relies on) instead of guessing from a full page happening to come back
+/// exactly full, which would show a "Load older" button that dead-ends once.
+fn paginate_timeline(
+    mut entries: Vec<TimelineEntry>,
+    page_size: u64,
+) -> (Vec<TimelineEntry>, Option<TimelineCursor>) {
+    let page_size = page_size as usize;
+    if entries.len() > page_size {
+        entries.truncate(page_size);
+        let cursor = entries
+            .last()
+            .map(|entry| TimelineCursor::new(entry.sort_key()));
+        (entries, cursor)
+    } else {
+        (entries, None)
+    }
+}
+
+/// Groups an already time-descending page of entries into calendar-day blocks.
+/// `continue_date`, when it matches the first entry's date, suppresses that
+/// first group's header: the caller is `/app/timeline/older` continuing a page
+/// whose last-shown day was already headed before this batch was appended.
+fn group_timeline_by_day(
+    entries: Vec<TimelineEntry>,
+    continue_date: Option<NaiveDate>,
+) -> Vec<TimelineDay> {
+    let mut days: Vec<TimelineDay> = Vec::new();
+    let mut current_date: Option<NaiveDate> = None;
+    for entry in entries {
+        let date = entry.sort_key().0.date_naive();
+        if current_date != Some(date) {
+            let label = if days.is_empty() && continue_date == Some(date) {
+                None
+            } else {
+                Some(date.format("%d %b").to_string())
+            };
+            days.push(TimelineDay {
+                label,
+                entries: Vec::new(),
+            });
+            current_date = Some(date);
+        }
+        days.last_mut()
+            .expect("a group was just pushed above")
+            .entries
+            .push(entry);
+    }
+    days
+}
+
 /// Data shared across the pet-header metrics strip and, when the matching tab is
 /// selected, reused directly by that tab instead of being queried twice.
 struct ConsoleData {
@@ -347,9 +436,22 @@ async fn render_tab_from_data(
                 }
                 None => 0,
             };
+            let raw_entries = db::list_timeline(
+                &state.db,
+                household_id,
+                pet.id,
+                None,
+                TIMELINE_PAGE_SIZE + 1,
+            )
+            .await?;
+            let (entries, next_cursor) = paginate_timeline(raw_entries, TIMELINE_PAGE_SIZE);
+            let entries_count = entries.len();
             TabTimelineTemplate {
                 selected_pet: Some(pet.clone()),
-                events: data.events,
+                pet_id: pet.id,
+                days: group_timeline_by_day(entries, None),
+                entries_count,
+                next_cursor,
                 knowledge,
                 related_count,
                 capture_message: None,
@@ -580,14 +682,15 @@ async fn create_symptom(
         "owner_form",
     )
     .await?;
-    let events = db::list_events(&state.db, user.household_id, Some(pet.id), 50).await?;
-    render(&AgentTimelineTemplate {
-        selected_pet: Some(pet),
-        events,
-        capture_message: Some("Saved structured symptom record.".into()),
-        capture_error: None,
-    })
-    .map(IntoResponse::into_response)
+    let template = render_agent_timeline(
+        &state,
+        user.household_id,
+        Some(pet),
+        Some("Saved structured symptom record.".into()),
+        None,
+    )
+    .await?;
+    render(&template).map(IntoResponse::into_response)
 }
 
 #[derive(Deserialize)]
@@ -823,22 +926,15 @@ async fn capture(
     {
         Ok(value) => value,
         Err(error) => {
-            let events = db::list_events(
-                &state.db,
+            let template = render_agent_timeline(
+                &state,
                 user.household_id,
-                selected_pet.as_ref().map(|pet| pet.id),
-                50,
+                selected_pet,
+                None,
+                Some(error.to_string()),
             )
             .await?;
-            return render_status(
-                &AgentTimelineTemplate {
-                    selected_pet,
-                    events,
-                    capture_message: None,
-                    capture_error: Some(error.to_string()),
-                },
-                StatusCode::UNPROCESSABLE_ENTITY,
-            );
+            return render_status(&template, StatusCode::UNPROCESSABLE_ENTITY);
         }
     };
     let pet = db::find_pet_by_name(&state.db, user.household_id, &intent.event.pet_name)
@@ -880,7 +976,6 @@ async fn capture(
             missed_prescriptions += 1;
         }
     }
-    let events = db::list_events(&state.db, user.household_id, Some(pet.id), 50).await?;
     let capture_message = if missed_prescriptions > 0 {
         format!(
             "Saved: {} Recorded missed doses for {} active prescription(s).",
@@ -889,15 +984,15 @@ async fn capture(
     } else {
         format!("Saved: {}", intent.event.summary)
     };
-    render_status(
-        &AgentTimelineTemplate {
-            selected_pet: Some(pet),
-            events,
-            capture_message: Some(capture_message),
-            capture_error: None,
-        },
-        StatusCode::OK,
+    let template = render_agent_timeline(
+        &state,
+        user.household_id,
+        Some(pet),
+        Some(capture_message),
+        None,
     )
+    .await?;
+    render_status(&template, StatusCode::OK)
 }
 
 async fn undo_event(
@@ -909,18 +1004,57 @@ async fn undo_event(
     db::undo_event(&state.db, user.household_id, &user.audit_actor(), id).await?;
     let pets = db::list_pets(&state.db, user.household_id).await?;
     let selected_pet = selected_from(&state, user.household_id, &pets, query.pet).await?;
-    let events = db::list_events(
-        &state.db,
+    let template = render_agent_timeline(
+        &state,
         user.household_id,
-        selected_pet.as_ref().map(|pet| pet.id),
-        50,
+        selected_pet,
+        Some("Event removed from the timeline.".into()),
+        None,
     )
     .await?;
-    render(&AgentTimelineTemplate {
-        selected_pet,
-        events,
-        capture_message: Some("Event removed from the timeline.".into()),
-        capture_error: None,
+    render(&template)
+}
+
+#[derive(Deserialize)]
+struct TimelineOlderQuery {
+    pet: i64,
+    before_at: String,
+    before_id: i64,
+}
+
+/// `GET /app/timeline/older` — the "Load older" affordance on the Timeline tab.
+/// Household-scoped the same way every other fragment route is: the pet id from
+/// the query string is resolved through `db::get_pet(household_id, pet_id)`
+/// before it's trusted for anything. Returns the next page of timeline rows plus
+/// an out-of-band replacement of the `#timeline-load-more` button (see
+/// `_timeline_load_more.html`), so the client only needs `hx-swap="beforeend"`
+/// on the visible rows and never has to manage the trigger itself.
+async fn timeline_older(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Query(query): Query<TimelineOlderQuery>,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, query.pet)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let before_at = DateTime::parse_from_rfc3339(&query.before_at)
+        .map(|at| at.with_timezone(&Utc))
+        .map_err(|_| AppError::validation("Invalid pagination cursor."))?;
+    let before = Some((before_at, query.before_id));
+    let raw_entries = db::list_timeline(
+        &state.db,
+        user.household_id,
+        pet.id,
+        before,
+        TIMELINE_PAGE_SIZE + 1,
+    )
+    .await?;
+    let (entries, next_cursor) = paginate_timeline(raw_entries, TIMELINE_PAGE_SIZE);
+    let days = group_timeline_by_day(entries, Some(before_at.date_naive()));
+    render(&TimelineOlderTemplate {
+        pet_id: pet.id,
+        days,
+        next_cursor,
     })
 }
 
@@ -1054,6 +1188,52 @@ async fn selected_from(
         Some(id) => Ok(db::get_pet(&state.db, household_id, id).await?),
         None => Ok(None),
     }
+}
+
+/// Builds the `AgentTimelineTemplate` shared by `capture`, `create_symptom` and
+/// `undo_event`: all three swap `#agent-and-timeline` back in via HTMX after a
+/// write, and after Phase 2 that swap must show the merged timeline (all four
+/// sources), not just `health_events`. Household-scoped through `selected_pet`,
+/// which every caller already resolved via `db::get_pet`/`selected_from`.
+async fn render_agent_timeline(
+    state: &AppState,
+    household_id: i64,
+    selected_pet: Option<Pet>,
+    capture_message: Option<String>,
+    capture_error: Option<String>,
+) -> Result<AgentTimelineTemplate, AppError> {
+    let (pet_id, days, entries_count, next_cursor) = match &selected_pet {
+        Some(pet) => {
+            let raw_entries = db::list_timeline(
+                &state.db,
+                household_id,
+                pet.id,
+                None,
+                TIMELINE_PAGE_SIZE + 1,
+            )
+            .await?;
+            let (entries, next_cursor) = paginate_timeline(raw_entries, TIMELINE_PAGE_SIZE);
+            let entries_count = entries.len();
+            (
+                pet.id,
+                group_timeline_by_day(entries, None),
+                entries_count,
+                next_cursor,
+            )
+        }
+        // No pet in the household at all: nothing to show, and pet_id is never
+        // read by the template in this branch (next_cursor is always None here).
+        None => (0, Vec::new(), 0, None),
+    };
+    Ok(AgentTimelineTemplate {
+        selected_pet,
+        pet_id,
+        days,
+        entries_count,
+        next_cursor,
+        capture_message,
+        capture_error,
+    })
 }
 
 async fn knowledge_for_events(
@@ -1238,7 +1418,10 @@ struct ConsoleTemplate {
 #[template(path = "_tab_timeline.html")]
 struct TabTimelineTemplate {
     selected_pet: Option<Pet>,
-    events: Vec<HealthEvent>,
+    pet_id: i64,
+    days: Vec<TimelineDay>,
+    entries_count: usize,
+    next_cursor: Option<TimelineCursor>,
     knowledge: Option<KnowledgeArticle>,
     related_count: u64,
     capture_message: Option<String>,
@@ -1298,9 +1481,22 @@ struct AccountTemplate {
 #[template(path = "_agent_timeline.html")]
 struct AgentTimelineTemplate {
     selected_pet: Option<Pet>,
-    events: Vec<HealthEvent>,
+    pet_id: i64,
+    days: Vec<TimelineDay>,
+    entries_count: usize,
+    next_cursor: Option<TimelineCursor>,
     capture_message: Option<String>,
     capture_error: Option<String>,
+}
+
+/// The `hx-get="/app/timeline/older"` response: the next page's rows plus an
+/// out-of-band replacement of the "Load older" trigger. See `_timeline_older.html`.
+#[derive(Template)]
+#[template(path = "_timeline_older.html")]
+struct TimelineOlderTemplate {
+    pet_id: i64,
+    days: Vec<TimelineDay>,
+    next_cursor: Option<TimelineCursor>,
 }
 
 #[derive(Template)]

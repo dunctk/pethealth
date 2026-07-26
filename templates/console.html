@@ -12,7 +12,7 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Pet Health home"><span class="brand-mark">P+</span><span>PET HEALTH</span></a>
+    <a class="brand" href="/app" aria-label="Pet Health console"><span class="brand-mark">P+</span><span>PET HEALTH</span></a>
     <details class="account-menu">
       <summary aria-label="Account menu"><span class="avatar">{{ user.initials }}</span><span>{{ user.display_name }}</span><span aria-hidden="true">⌄</span></summary>
       <div class="account-popover floating-material">
@@ -27,7 +27,7 @@
       <div class="side-label">YOUR PETS</div>
       <nav class="pet-list" aria-label="Your pets">
         {% for pet in pets %}
-        <a href="/?pet={{ pet.id }}" class="pet-link {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}active{% endif %}{% when None %}{% endmatch %}" {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}aria-current="page"{% endif %}{% when None %}{% endmatch %}>
+        <a href="/app?pet={{ pet.id }}" class="pet-link {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}active{% endif %}{% when None %}{% endmatch %}" {% match selected_pet %}{% when Some with (selected) %}{% if selected.id == pet.id %}aria-current="page"{% endif %}{% when None %}{% endmatch %}>
           <span class="pet-avatar">{{ pet.initials }}</span><span><b>{{ pet.name }}</b><small>{{ pet.species }}</small></span>
         </a>
         {% endfor %}
@@ -63,7 +63,6 @@
     </main>
 
     <aside class="context-panel">
-      {% include "_mcp_connect.html" %}
       <section class="context-head"><div class="side-label">HELP FOR THIS HISTORY</div></section>
       {% match knowledge %}
       {% when Some with (article) %}

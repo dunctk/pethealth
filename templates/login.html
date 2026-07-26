@@ -9,7 +9,7 @@
   <script src="/static/app.js" defer></script>
 </head>
 <body class="auth-page">
-  <header class="auth-topbar"><a class="brand" href="/login"><span class="brand-mark">P+</span><span>PET HEALTH</span></a><span>YOUR PET'S HEALTH HISTORY</span></header>
+  <header class="auth-topbar"><a class="brand" href="/"><span class="brand-mark">P+</span><span>PET HEALTH</span></a><span>YOUR PET'S HEALTH HISTORY</span></header>
   <main class="auth-shell">
     <section class="auth-context" aria-label="Product overview">
       <div class="eyebrow">PET CARE / ONE TIMELINE</div>
@@ -27,7 +27,6 @@
         <label>Password<input required minlength="12" maxlength="128" type="password" name="password" autocomplete="current-password"></label>
         <button class="button primary" type="submit">Sign in</button>
       </form>
-      {% include "_mcp_connect.html" %}
       <p class="auth-switch">New to Pet Health? <a href="/register">Create an account</a></p>
     </section>
   </main>

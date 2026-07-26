@@ -22,7 +22,7 @@ const CSS: &str = include_str!("../static/app.css");
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
-        .route("/", get(index))
+        .route("/app", get(index))
         .route("/pets", post(create_pet))
         .route("/weights", post(create_weight))
         .route("/symptoms", post(create_symptom))
@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(ocr::MAX_UPLOAD_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
+        .route("/", get(home_page))
         .route("/healthz", get(healthz))
         .route("/favicon.ico", get(favicon))
         .route("/static/app.css", get(css))
@@ -88,12 +89,7 @@ struct LoginPageQuery {
     next: Option<String>,
 }
 
-async fn login_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<LoginPageQuery>,
-) -> Result<Html<String>, AppError> {
-    let origin = request_origin(&state, &headers);
+async fn login_page(Query(query): Query<LoginPageQuery>) -> Result<Html<String>, AppError> {
     render(&LoginTemplate {
         identifier: String::new(),
         error: None,
@@ -102,6 +98,15 @@ async fn login_page(
             .unwrap_or(false)
             .then(|| "Password updated. Sign in again on this device.".into()),
         next: query.next,
+    })
+}
+
+async fn home_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let origin = request_origin(&state, &headers);
+    render(&HomeTemplate {
         mcp_url: format!("{origin}/mcp"),
         device_url: format!("{origin}/oauth/device"),
     })
@@ -137,21 +142,18 @@ async fn login(
         None
     };
     let Some(user) = valid else {
-        let origin = request_origin(&state, &headers);
         return render_status(
             &LoginTemplate {
                 identifier,
                 error: Some("Email/username or password is incorrect.".into()),
                 notice: None,
                 next: form.next,
-                mcp_url: format!("{origin}/mcp"),
-                device_url: format!("{origin}/oauth/device"),
             },
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     };
     let token = db::create_session(&state.db, user.id).await?;
-    let destination = safe_login_next(form.next.as_deref()).unwrap_or("/");
+    let destination = safe_login_next(form.next.as_deref()).unwrap_or("/app");
     Ok(session_redirect(
         destination,
         session_cookie(&state, &token, false),
@@ -196,7 +198,10 @@ async fn register(
     let password_hash = auth::hash_password(form.password).await?;
     let user = db::create_account(&state.db, &email, &display_name, &password_hash).await?;
     let token = db::create_session(&state.db, user.id).await?;
-    Ok(session_redirect("/", session_cookie(&state, &token, false)))
+    Ok(session_redirect(
+        "/app",
+        session_cookie(&state, &token, false),
+    ))
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
@@ -260,7 +265,6 @@ struct IndexQuery {
 
 async fn index(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Extension(user): Extension<UserAccount>,
     Query(query): Query<IndexQuery>,
 ) -> Result<Html<String>, AppError> {
@@ -303,7 +307,6 @@ async fn index(
         Some(pet) => db::list_adherence(&state.db, user.household_id, pet.id, 30).await?,
         None => Vec::new(),
     };
-    let origin = request_origin(&state, &headers);
     render(&ConsoleTemplate {
         user,
         pets,
@@ -320,8 +323,6 @@ async fn index(
         new_share_path: None,
         capture_message: None,
         capture_error: None,
-        mcp_url: format!("{origin}/mcp"),
-        device_url: format!("{origin}/oauth/device"),
     })
 }
 
@@ -359,7 +360,7 @@ async fn create_pet(
         form.weight_kg,
     )
     .await?;
-    Ok(Redirect::to(&format!("/?pet={id}")))
+    Ok(Redirect::to(&format!("/app?pet={id}")))
 }
 
 #[derive(Deserialize)]
@@ -402,7 +403,7 @@ async fn create_weight(
         clean_optional(form.note.as_deref(), 240),
     )
     .await?;
-    Ok(Redirect::to(&format!("/?pet={}", form.pet_id)))
+    Ok(Redirect::to(&format!("/app?pet={}", form.pet_id)))
 }
 
 #[derive(Deserialize)]
@@ -510,7 +511,7 @@ async fn create_medication(
         clean_optional(form.note.as_deref(), 500),
     )
     .await?;
-    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
+    Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
 }
 
 #[derive(Deserialize)]
@@ -564,7 +565,7 @@ async fn create_prescription(
         clean_optional(form.raw_input.as_deref(), 1000),
     )
     .await?;
-    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
+    Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
 }
 
 #[derive(Deserialize)]
@@ -613,7 +614,7 @@ async fn create_adherence(
         clean_optional(form.raw_input.as_deref(), 1000),
     )
     .await?;
-    Ok(Redirect::to(&format!("/?pet={}", pet.id)))
+    Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
 }
 
 async fn import_blood_tests(
@@ -634,7 +635,7 @@ async fn import_blood_tests(
         .filter(|item| item.report_id.is_some())
         .count();
     tracing::info!(user = user.id, imported_count, "blood-test import finished");
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/app"))
 }
 
 async fn upload_blood_test(
@@ -673,7 +674,7 @@ async fn upload_blood_test(
         .filter(|item| item.report_id.is_some())
         .count();
     tracing::info!(user = user.id, imported_count, "blood-test upload finished");
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/app"))
 }
 
 #[derive(Deserialize)]
@@ -1087,6 +1088,13 @@ fn render_status<T: Template>(template: &T, status: StatusCode) -> Result<Respon
 }
 
 #[derive(Template)]
+#[template(path = "home.html")]
+struct HomeTemplate {
+    mcp_url: String,
+    device_url: String,
+}
+
+#[derive(Template)]
 #[template(path = "console.html")]
 struct ConsoleTemplate {
     user: UserAccount,
@@ -1104,8 +1112,6 @@ struct ConsoleTemplate {
     new_share_path: Option<String>,
     capture_message: Option<String>,
     capture_error: Option<String>,
-    mcp_url: String,
-    device_url: String,
 }
 
 #[derive(Template)]
@@ -1115,8 +1121,6 @@ struct LoginTemplate {
     error: Option<String>,
     notice: Option<String>,
     next: Option<String>,
-    mcp_url: String,
-    device_url: String,
 }
 
 #[derive(Template)]

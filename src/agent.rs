@@ -20,6 +20,7 @@ struct LlmConfig {
     api_key: String,
     base_url: String,
     model: String,
+    timeout: std::time::Duration,
 }
 
 #[derive(Debug, Error)]
@@ -28,21 +29,31 @@ pub enum CaptureError {
     PetMissing,
     #[error("I found more than one possible pet. Please use the pet's full name.")]
     PetAmbiguous,
-    #[error(
-        "I couldn't understand that yet. Try “Milo vomited just now” or describe one thing that happened."
-    )]
-    Unsupported,
+    /// Carries a worked example built from the household's own pets. Hardcoding a
+    /// name here suggested "Milo" to every household, including the ones whose
+    /// pets are called something else entirely.
+    #[error("I couldn't understand that yet. Try “{example}” or describe one thing that happened.")]
+    Unsupported { example: String },
     #[error("The configured language model could not parse that observation.")]
     Model,
     #[error("The language model did not answer in time. Nothing was saved — try again.")]
     ModelTimeout,
 }
 
-/// How long to wait on the extraction call before giving up. `rig` builds its own
-/// HTTP client with no timeout, so without this a stalled upstream leaves the
-/// POST open indefinitely and the capture box sits on "SAVING..." forever with
-/// nothing saved and no way to recover but a reload.
-const MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// The example phrasing offered when nothing could be extracted. Prefers the pet
+/// the user is already looking at, then any pet in the household, so the hint
+/// names an animal they actually own.
+fn unsupported_example(pet_names: &[String], selected_pet: Option<&str>) -> CaptureError {
+    let pet = selected_pet
+        .map(str::to_owned)
+        .or_else(|| pet_names.first().cloned());
+    CaptureError::Unsupported {
+        example: match pet {
+            Some(name) => format!("{name} vomited just now"),
+            None => "Milo vomited just now".to_owned(),
+        },
+    }
+}
 
 impl CaptureAgent {
     pub fn new(config: &Config) -> Self {
@@ -51,6 +62,7 @@ impl CaptureAgent {
                 api_key: api_key.clone(),
                 base_url: config.llm_base_url.clone(),
                 model: config.llm_model.clone(),
+                timeout: std::time::Duration::from_secs(config.llm_timeout_seconds),
             }),
         }
     }
@@ -73,13 +85,22 @@ impl CaptureAgent {
             return Ok(intent);
         }
         let Some(llm) = &self.llm else {
-            return Err(CaptureError::Unsupported);
+            // No LLM_API_KEY, so the keyword ladder above is the whole extractor
+            // and it did not match. Say so in the log: from the outside this is
+            // indistinguishable from a model that ran and failed.
+            tracing::info!(
+                "capture fell through to the deterministic parser with no model configured; set LLM_API_KEY to enable extraction"
+            );
+            return Err(unsupported_example(pet_names, selected_pet));
         };
         let client = openai::Client::builder()
             .api_key(&llm.api_key)
             .base_url(&llm.base_url)
             .build()
-            .map_err(|_| CaptureError::Model)?;
+            .map_err(|error| {
+                tracing::error!(%error, base_url = %llm.base_url, "could not build the model client");
+                CaptureError::Model
+            })?;
         let prompt = format!(
             "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. \
              event_type must be one of observation, symptom, medication, measurement, vet_visit. \
@@ -89,15 +110,28 @@ impl CaptureAgent {
             input
         );
         let proposal = tokio::time::timeout(
-            MODEL_TIMEOUT,
+            llm.timeout,
             client
                 .extractor::<ProposedEvent>(&llm.model)
                 .build()
                 .extract(&prompt),
         )
         .await
-        .map_err(|_| CaptureError::ModelTimeout)?
-        .map_err(|_| CaptureError::Model)?;
+        .map_err(|_| {
+            tracing::warn!(
+                model = %llm.model,
+                timeout_seconds = llm.timeout.as_secs(),
+                "model did not answer before the timeout; nothing saved"
+            );
+            CaptureError::ModelTimeout
+        })?
+        .map_err(|error| {
+            // Previously `map_err(|_| ...)` threw this away, so a misconfigured
+            // model, a bad key, or a provider outage all surfaced as the same
+            // opaque message with nothing in the log to tell them apart.
+            tracing::error!(%error, model = %llm.model, "model extraction failed");
+            CaptureError::Model
+        })?;
         validate_pet(&proposal.pet_name, pet_names)?;
         Ok(CaptureIntent {
             event: proposal,

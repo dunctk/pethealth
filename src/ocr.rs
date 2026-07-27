@@ -402,6 +402,7 @@ mod tests {
             llm_api_key: None,
             llm_base_url: String::new(),
             llm_model: String::new(),
+            llm_timeout_seconds: 20,
             mistral_api_key: None,
             blood_tests_dir: root.to_string_lossy().into_owned(),
         }

@@ -34,7 +34,15 @@ pub enum CaptureError {
     Unsupported,
     #[error("The configured language model could not parse that observation.")]
     Model,
+    #[error("The language model did not answer in time. Nothing was saved — try again.")]
+    ModelTimeout,
 }
+
+/// How long to wait on the extraction call before giving up. `rig` builds its own
+/// HTTP client with no timeout, so without this a stalled upstream leaves the
+/// POST open indefinitely and the capture box sits on "SAVING..." forever with
+/// nothing saved and no way to recover but a reload.
+const MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl CaptureAgent {
     pub fn new(config: &Config) -> Self {
@@ -80,12 +88,16 @@ impl CaptureAgent {
             selected_pet.unwrap_or("none"),
             input
         );
-        let proposal = client
-            .extractor::<ProposedEvent>(&llm.model)
-            .build()
-            .extract(&prompt)
-            .await
-            .map_err(|_| CaptureError::Model)?;
+        let proposal = tokio::time::timeout(
+            MODEL_TIMEOUT,
+            client
+                .extractor::<ProposedEvent>(&llm.model)
+                .build()
+                .extract(&prompt),
+        )
+        .await
+        .map_err(|_| CaptureError::ModelTimeout)?
+        .map_err(|_| CaptureError::Model)?;
         validate_pet(&proposal.pet_name, pet_names)?;
         Ok(CaptureIntent {
             event: proposal,

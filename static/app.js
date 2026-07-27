@@ -693,3 +693,18 @@ document.addEventListener("htmx:afterRequest", (event) => {
   const dialog = form.closest("dialog");
   if (dialog && dialog.open) dialog.close();
 });
+
+// htmx 2 does not swap 4xx responses: its default `responseHandling` marks
+// `[45]..` as `swap: false`. Every capture failure the server renders — the
+// pet-missing, pet-ambiguous, not-understood and model-timeout messages, all
+// returned as 422 by `render_status` — was therefore built, sent, and silently
+// dropped on the floor. The indicator cleared and the user saw nothing at all.
+//
+// 422 is the honest status for "your input did not validate", so keep it and
+// opt that one code into swapping instead of downgrading the response to 200.
+document.addEventListener("htmx:beforeSwap", (event) => {
+  if (event.detail.xhr && event.detail.xhr.status === 422) {
+    event.detail.shouldSwap = true;
+    event.detail.isError = false;
+  }
+});

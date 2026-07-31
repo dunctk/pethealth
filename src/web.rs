@@ -1,5 +1,7 @@
 use crate::{
-    AppState, auth, db,
+    AppState,
+    agent::ChatReply,
+    auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
         MedicationPrescription, Pet, ShareGrant, TimelineEntry, UserAccount, WeightEntry,
@@ -16,7 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const CSS: &str = include_str!("../static/app.css");
 
@@ -39,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/blood-tests/upload", post(upload_blood_test))
         .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
+        .route("/agent/chat", post(agent_chat))
         .route("/events/{id}/undo", post(undo_event))
         .route("/shares", post(create_share))
         .route("/shares/{id}/revoke", post(revoke_share))
@@ -304,6 +307,22 @@ impl ConsoleView {
     fn is_sharing(self) -> bool {
         self == Self::Sharing
     }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timeline => "Timeline",
+            Self::Plan => "Plan",
+            Self::Labs => "Labs",
+            Self::Sharing => "Sharing",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Self::Timeline => "timeline",
+            Self::Plan => "plan",
+            Self::Labs => "labs",
+            Self::Sharing => "sharing",
+        }
+    }
 }
 
 /// How many timeline entries a page shows. `render_tab_from_data` and the
@@ -449,13 +468,10 @@ async fn render_tab_from_data(
             let (entries, next_cursor) = paginate_timeline(raw_entries, TIMELINE_PAGE_SIZE);
             let entries_count = entries.len();
             TabTimelineTemplate {
-                selected_pet: Some(pet.clone()),
                 pet_id: pet.id,
                 days: group_timeline_by_day(entries, None),
                 entries_count,
                 next_cursor,
-                capture_message: None,
-                capture_error: None,
                 load_more_oob: false,
             }
             .render()?
@@ -502,6 +518,7 @@ async fn index(
     };
     let view = ConsoleView::parse(query.view.as_deref());
     let mut tab_html = String::new();
+    let mut assistant_html = String::new();
     let mut events_count = 0;
     let mut latest_weight = None;
     let mut shares_count = 0;
@@ -516,6 +533,7 @@ async fn index(
             .iter()
             .filter(|item| item.status == "active")
             .count();
+        assistant_html = render_assistant_workbench(pet, view, "record", Vec::new(), None)?;
         tab_html = render_tab_from_data(&state, user.household_id, pet, view, data).await?;
     }
     render(&ConsoleTemplate {
@@ -524,6 +542,7 @@ async fn index(
         selected_pet,
         view,
         tab_html,
+        assistant_html,
         events_count,
         latest_weight,
         shares_count,
@@ -761,7 +780,7 @@ async fn create_weight(
         clean_optional(form.note.as_deref(), 240),
     )
     .await?;
-    timeline_write_response(&state, &headers, user.household_id, pet, "Saved weight.").await
+    timeline_write_response(&state, &headers, user.household_id, pet, true).await
 }
 
 #[derive(Deserialize)]
@@ -818,14 +837,7 @@ async fn create_symptom(
         "owner_form",
     )
     .await?;
-    timeline_write_response(
-        &state,
-        &headers,
-        user.household_id,
-        pet,
-        "Saved structured symptom record.",
-    )
-    .await
+    timeline_write_response(&state, &headers, user.household_id, pet, false).await
 }
 
 #[derive(Deserialize)]
@@ -873,7 +885,7 @@ async fn create_medication(
         clean_optional(form.note.as_deref(), 500),
     )
     .await?;
-    timeline_write_response(&state, &headers, user.household_id, pet, "Saved dose.").await
+    timeline_write_response(&state, &headers, user.household_id, pet, false).await
 }
 
 #[derive(Deserialize)]
@@ -1093,16 +1105,68 @@ struct CaptureForm {
     selected_pet_id: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct ChatForm {
+    message: String,
+    pet_id: i64,
+    view: Option<String>,
+    mode: Option<String>,
+    history: Option<String>,
+}
+
 async fn capture(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
     Form(form): Form<CaptureForm>,
 ) -> Result<Response, AppError> {
-    let message = clean_required(&form.message, 1000, "Observation")?.to_owned();
+    record_agent_event(
+        &state,
+        &user,
+        &headers,
+        &form.message,
+        form.selected_pet_id,
+        ConsoleView::Timeline,
+        None,
+    )
+    .await
+}
+
+async fn agent_chat(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
+    Form(form): Form<ChatForm>,
+) -> Result<Response, AppError> {
+    let view = ConsoleView::parse(form.view.as_deref());
+    if form.mode.as_deref() == Some("record") {
+        return record_agent_event(
+            &state,
+            &user,
+            &headers,
+            &form.message,
+            Some(form.pet_id),
+            view,
+            form.history.as_deref(),
+        )
+        .await;
+    }
+    answer_agent_chat(&state, &user, &headers, form, view).await
+}
+
+async fn record_agent_event(
+    state: &AppState,
+    user: &UserAccount,
+    headers: &HeaderMap,
+    raw_message: &str,
+    selected_pet_id: Option<i64>,
+    view: ConsoleView,
+    raw_history: Option<&str>,
+) -> Result<Response, AppError> {
+    let message = clean_required(raw_message, 1000, "Observation")?.to_owned();
     let pets = db::list_pets(&state.db, user.household_id).await?;
     let names: Vec<_> = pets.iter().map(|pet| pet.name.clone()).collect();
-    let selected_pet =
-        selected_from(&state, user.household_id, &pets, form.selected_pet_id).await?;
+    let selected_pet = selected_from(state, user.household_id, &pets, selected_pet_id).await?;
     let selected_pet_name = selected_pet.as_ref().map(|pet| pet.name.as_str());
     let intent = match state
         .agent
@@ -1111,15 +1175,15 @@ async fn capture(
     {
         Ok(value) => value,
         Err(error) => {
-            let template = render_agent_timeline(
-                &state,
-                user.household_id,
-                selected_pet,
-                None,
-                Some(error.to_string()),
-            )
-            .await?;
-            return render_status(&template, StatusCode::UNPROCESSABLE_ENTITY);
+            return assistant_error_response(
+                headers,
+                selected_pet.as_ref(),
+                view,
+                raw_history,
+                "RECORD NEEDS CLARIFICATION",
+                error.to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
         }
     };
     let pet = db::find_pet_by_name(&state.db, user.household_id, &intent.event.pet_name)
@@ -1169,15 +1233,390 @@ async fn capture(
     } else {
         format!("Saved: {}", intent.event.summary)
     };
-    let template = render_agent_timeline(
-        &state,
-        user.household_id,
-        Some(pet),
-        Some(capture_message),
-        None,
+    let mut history = parse_assistant_history(raw_history);
+    let mut display_turns = history.clone();
+    display_turns.push(AssistantTurn {
+        role: "user".into(),
+        content: message.clone(),
+    });
+    history.push(AssistantTurn {
+        role: "user".into(),
+        content: message,
+    });
+    history.push(AssistantTurn {
+        role: "assistant".into(),
+        content: capture_message.clone(),
+    });
+    let reply = AssistantReply {
+        kind: "answer".into(),
+        title: "RECORDED IN THE TIMELINE".into(),
+        answer: capture_message,
+        evidence: vec![AssistantEvidence {
+            label: "Original wording".into(),
+            detail: "saved with the event".into(),
+            href: Some(format!("/app?pet={}&view=timeline", pet.id)),
+        }],
+        suggested_prompts: vec![
+            "Summarize the recent history".into(),
+            "Prepare questions for our next vet visit".into(),
+        ],
+    };
+    let assistant_html = render_assistant_workbench_with_history(
+        &pet,
+        view,
+        "record",
+        display_turns,
+        history,
+        Some(reply),
+    )?;
+    let timeline = render_agent_timeline(state, user.household_id, Some(pet.clone())).await?;
+    let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
+        .await?
+        .len();
+    assistant_fragment_response(
+        headers,
+        assistant_html,
+        Some(timeline.render()?),
+        Some(events_count),
     )
-    .await?;
-    render_status(&template, StatusCode::OK)
+}
+
+async fn answer_agent_chat(
+    state: &AppState,
+    user: &UserAccount,
+    headers: &HeaderMap,
+    form: ChatForm,
+    view: ConsoleView,
+) -> Result<Response, AppError> {
+    let question = clean_required(&form.message, 1000, "Question")?.to_owned();
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let entries = db::list_timeline(&state.db, user.household_id, pet.id, None, 50).await?;
+    let (context, evidence) = chat_context(&pet, &entries);
+    let history = parse_assistant_history(form.history.as_deref());
+    let history_text = history
+        .iter()
+        .map(|turn| format!("{}: {}", turn.role, turn.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reply = match state
+        .chat
+        .answer(
+            &question,
+            &pet.name,
+            &pet.species,
+            view.label(),
+            &context,
+            &history_text,
+        )
+        .await
+    {
+        Ok(Some(reply)) => assistant_reply_from_chat(reply, evidence),
+        Ok(None) => fallback_chat_reply(&question, &pet, &entries, evidence),
+        Err(error) => AssistantReply {
+            kind: "clarification".into(),
+            title: "COPILOT UNAVAILABLE".into(),
+            answer: format!(
+                "{error} Your record is unchanged. You can still use Record mode or try again."
+            ),
+            evidence: Vec::new(),
+            suggested_prompts: vec!["Record what happened".into()],
+        },
+    };
+    let mut display_turns = history.clone();
+    display_turns.push(AssistantTurn {
+        role: "user".into(),
+        content: question,
+    });
+    let mut stored_history = display_turns.clone();
+    stored_history.push(AssistantTurn {
+        role: "assistant".into(),
+        content: reply.answer.clone(),
+    });
+    let assistant_html = render_assistant_workbench_with_history(
+        &pet,
+        view,
+        "ask",
+        display_turns,
+        stored_history,
+        Some(reply),
+    )?;
+    assistant_fragment_response(headers, assistant_html, None, None)
+}
+
+fn assistant_error_response(
+    headers: &HeaderMap,
+    pet: Option<&Pet>,
+    view: ConsoleView,
+    raw_history: Option<&str>,
+    title: &str,
+    answer: String,
+    status: StatusCode,
+) -> Result<Response, AppError> {
+    let Some(pet) = pet else {
+        return Ok((status, Html(escape(&answer))).into_response());
+    };
+    let history = parse_assistant_history(raw_history);
+    let reply = AssistantReply {
+        kind: "clarification".into(),
+        title: title.into(),
+        answer,
+        evidence: Vec::new(),
+        suggested_prompts: vec!["Summarize the recent history".into()],
+    };
+    let html = render_assistant_workbench_with_history(
+        pet,
+        view,
+        "record",
+        history.clone(),
+        history,
+        Some(reply),
+    )?;
+    let response = as_refresh_template("assistant-refresh", html);
+    if !wants_fragment(headers) {
+        return Ok((status, Html(response)).into_response());
+    }
+    Ok((status, Html(response)).into_response())
+}
+
+fn assistant_fragment_response(
+    headers: &HeaderMap,
+    assistant_html: String,
+    timeline_html: Option<String>,
+    events_count: Option<usize>,
+) -> Result<Response, AppError> {
+    if !wants_fragment(headers) {
+        return Ok(Redirect::to("/app").into_response());
+    }
+    let mut html = as_refresh_template("assistant-refresh", assistant_html);
+    if let Some(timeline_html) = timeline_html {
+        html.push_str(&as_refresh_template("timeline-refresh", timeline_html));
+    }
+    if let Some(events_count) = events_count {
+        html.push_str(&as_refresh_template(
+            "events-refresh",
+            EventsMetricTemplate { events_count }.render()?,
+        ));
+    }
+    Ok((StatusCode::OK, Html(html)).into_response())
+}
+
+fn parse_assistant_history(raw: Option<&str>) -> Vec<AssistantTurn> {
+    raw.and_then(|value| serde_json::from_str::<Vec<AssistantTurn>>(value).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant"))
+        .map(|mut turn| {
+            turn.content = turn.content.chars().take(1000).collect();
+            turn
+        })
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn assistant_reply_from_chat(reply: ChatReply, evidence: Vec<AssistantEvidence>) -> AssistantReply {
+    let (kind, title) = match reply.kind.as_str() {
+        "clarification" => ("clarification", "A LITTLE MORE CONTEXT"),
+        "safety" => ("safety", "SAFETY BOUNDARY"),
+        _ => ("answer", "RECORD ANALYST"),
+    };
+    AssistantReply {
+        kind: kind.into(),
+        title: title.into(),
+        answer: reply.answer,
+        evidence,
+        suggested_prompts: reply.suggested_prompts,
+    }
+}
+
+fn chat_context(pet: &Pet, entries: &[TimelineEntry]) -> (String, Vec<AssistantEvidence>) {
+    let href = format!("/app?pet={}&view=timeline", pet.id);
+    let mut lines = vec![format!("Pet: {} ({})", pet.name, pet.species)];
+    let mut evidence = Vec::new();
+    for entry in entries.iter().take(12) {
+        match entry {
+            TimelineEntry::Event(event) => {
+                lines.push(format!(
+                    "{} | observation | {} | original wording: {}",
+                    event.occurred_at.to_rfc3339(),
+                    event.summary,
+                    event.raw_input
+                ));
+                evidence.push(AssistantEvidence {
+                    label: event.summary.clone(),
+                    detail: event.occurred_at.format("%d %b").to_string(),
+                    href: Some(href.clone()),
+                });
+            }
+            TimelineEntry::Weight(weight) => {
+                lines.push(format!(
+                    "{} | weight | {:.2} kg{}",
+                    weight.measured_at.to_rfc3339(),
+                    weight.weight_kg,
+                    weight
+                        .note
+                        .as_deref()
+                        .map(|note| format!(" | note: {note}"))
+                        .unwrap_or_default()
+                ));
+                evidence.push(AssistantEvidence {
+                    label: format!("{:.2} kg", weight.weight_kg),
+                    detail: weight.measured_at.format("%d %b").to_string(),
+                    href: Some(href.clone()),
+                });
+            }
+            TimelineEntry::Dose(dose) => {
+                lines.push(format!(
+                    "{} | medication | {} | status: {}",
+                    dose.administered_at.to_rfc3339(),
+                    dose.name,
+                    dose.status
+                ));
+                evidence.push(AssistantEvidence {
+                    label: dose.name.clone(),
+                    detail: dose.administered_at.format("%d %b").to_string(),
+                    href: Some(href.clone()),
+                });
+            }
+            TimelineEntry::Lab(lab) => {
+                let results = lab
+                    .results
+                    .iter()
+                    .take(6)
+                    .map(|result| format!("{}={}", result.test_name, result.value_text))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "{} | lab report | {} | results: {}",
+                    lab.test_date.as_deref().unwrap_or("date unavailable"),
+                    lab.source_filename,
+                    results
+                ));
+                evidence.push(AssistantEvidence {
+                    label: "Lab report".into(),
+                    detail: lab
+                        .test_date
+                        .clone()
+                        .unwrap_or_else(|| "import date".into()),
+                    href: Some(format!("/app?pet={}&view=labs", pet.id)),
+                });
+            }
+        }
+    }
+    (lines.join("\n"), evidence.into_iter().take(6).collect())
+}
+
+fn fallback_chat_reply(
+    question: &str,
+    pet: &Pet,
+    entries: &[TimelineEntry],
+    evidence: Vec<AssistantEvidence>,
+) -> AssistantReply {
+    let lower = question.to_lowercase();
+    if lower.contains("diagnos") || lower.contains("what is wrong") {
+        return AssistantReply {
+            kind: "safety".into(),
+            title: "SAFETY BOUNDARY".into(),
+            answer: "I can summarize recorded facts and help prepare questions, but I cannot diagnose your pet. A veterinarian should interpret symptoms, especially if they are severe, worsening, or accompanied by urgent signs.".into(),
+            evidence,
+            suggested_prompts: vec![
+                "Summarize the recent history".into(),
+                "Prepare questions for our next vet visit".into(),
+            ],
+        };
+    }
+    if lower.contains("weight") || lower.contains("weigh") {
+        let weights = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Weight(weight) => Some(weight),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let answer = match weights.first() {
+            Some(latest) => {
+                let previous = weights
+                    .get(1)
+                    .map(|weight| latest.weight_kg - weight.weight_kg);
+                match previous {
+                    Some(delta) => format!(
+                        "The latest recorded weight for {} is {:.2} kg on {}. That is {:+.2} kg compared with the previous recorded measurement.",
+                        pet.name,
+                        latest.weight_kg,
+                        latest.measured_at.format("%d %b %Y"),
+                        delta
+                    ),
+                    None => format!(
+                        "The latest recorded weight for {} is {:.2} kg on {}. There is only one dated measurement in the record.",
+                        pet.name,
+                        latest.weight_kg,
+                        latest.measured_at.format("%d %b %Y")
+                    ),
+                }
+            }
+            None => format!(
+                "There are no dated weight measurements recorded for {} yet.",
+                pet.name
+            ),
+        };
+        return AssistantReply {
+            kind: "answer".into(),
+            title: "WEIGHT CHECK".into(),
+            answer,
+            evidence,
+            suggested_prompts: vec!["Summarize the recent history".into()],
+        };
+    }
+    let recent = entries
+        .iter()
+        .take(4)
+        .map(|entry| match entry {
+            TimelineEntry::Event(event) => {
+                format!("{} ({})", event.summary, event.occurred_at.format("%d %b"))
+            }
+            TimelineEntry::Weight(weight) => format!(
+                "Weight {:.2} kg ({})",
+                weight.weight_kg,
+                weight.measured_at.format("%d %b")
+            ),
+            TimelineEntry::Dose(dose) => format!(
+                "{} recorded ({})",
+                dose.name,
+                dose.administered_at.format("%d %b")
+            ),
+            TimelineEntry::Lab(lab) => format!(
+                "Lab report ({})",
+                lab.test_date.as_deref().unwrap_or("date unavailable")
+            ),
+        })
+        .collect::<Vec<_>>();
+    let answer = if recent.is_empty() {
+        format!(
+            "I do not have any dated timeline entries for {} yet. You can switch to Record mode and describe what happened.",
+            pet.name
+        )
+    } else {
+        format!(
+            "The most recent recorded items for {} are: {}. These are record summaries, not a diagnosis.",
+            pet.name,
+            recent.join("; ")
+        )
+    };
+    AssistantReply {
+        kind: "answer".into(),
+        title: "RECENT HISTORY".into(),
+        answer,
+        evidence,
+        suggested_prompts: vec![
+            "What has changed in the last 7 days?".into(),
+            "Prepare questions for our next vet visit".into(),
+        ],
+    }
 }
 
 async fn undo_event(
@@ -1189,15 +1628,19 @@ async fn undo_event(
     db::undo_event(&state.db, user.household_id, &user.audit_actor(), id).await?;
     let pets = db::list_pets(&state.db, user.household_id).await?;
     let selected_pet = selected_from(&state, user.household_id, &pets, query.pet).await?;
-    let template = render_agent_timeline(
-        &state,
-        user.household_id,
-        selected_pet,
-        Some("Event removed from the timeline.".into()),
-        None,
-    )
-    .await?;
-    render(&template)
+    let template = render_agent_timeline(&state, user.household_id, selected_pet.clone()).await?;
+    let mut html = as_refresh_template("timeline-refresh", template.render()?);
+    let events_count = match selected_pet {
+        Some(pet) => db::list_events(&state.db, user.household_id, Some(pet.id), 50)
+            .await?
+            .len(),
+        None => 0,
+    };
+    html.push_str(&as_refresh_template(
+        "events-refresh",
+        EventsMetricTemplate { events_count }.render()?,
+    ));
+    Ok(Html(html))
 }
 
 #[derive(Deserialize)]
@@ -1376,25 +1819,12 @@ async fn selected_from(
     }
 }
 
-/// Builds the `AgentTimelineTemplate` shared by `capture`, `create_symptom`,
-/// `undo_event`, and the `+ Record` dialog writes (weight, dose, structured
-/// symptom): all swap `#agent-and-timeline` back in after a write, and after
-/// Phase 2 that swap must show the merged timeline (all four sources), not
-/// just `health_events`. Household-scoped through `selected_pet`, which every
-/// caller already resolved via `db::get_pet`/`selected_from`.
-///
-/// `capture` and `undo_event` target `#agent-and-timeline` directly
-/// (`hx-swap="outerHTML"`) from a form that only ever exists while that
-/// element is already on screen. The `+ Record` dialog writes are reachable
-/// from *any* tab, so they can't assume that — see `timeline_write_response`,
-/// which wraps this same rendering in an inert `<template>` for those
-/// callers instead of targeting `#agent-and-timeline` at all.
+/// Builds the merged timeline fragment for the selected pet. Every caller has
+/// already resolved the pet through a household-scoped lookup.
 async fn render_agent_timeline(
     state: &AppState,
     household_id: i64,
     selected_pet: Option<Pet>,
-    capture_message: Option<String>,
-    capture_error: Option<String>,
 ) -> Result<AgentTimelineTemplate, AppError> {
     let (pet_id, days, entries_count, next_cursor) = match &selected_pet {
         Some(pet) => {
@@ -1420,13 +1850,10 @@ async fn render_agent_timeline(
         None => (0, Vec::new(), 0, None),
     };
     Ok(AgentTimelineTemplate {
-        selected_pet,
         pet_id,
         days,
         entries_count,
         next_cursor,
-        capture_message,
-        capture_error,
         load_more_oob: false,
     })
 }
@@ -1467,18 +1894,36 @@ async fn timeline_write_response(
     headers: &HeaderMap,
     household_id: i64,
     pet: Pet,
-    message: &str,
+    refresh_latest_weight: bool,
 ) -> Result<Response, AppError> {
     if wants_fragment(headers) {
-        let template = render_agent_timeline(
-            state,
-            household_id,
-            Some(pet),
-            Some(message.to_owned()),
-            None,
-        )
-        .await?;
-        let html = as_refresh_template("timeline-refresh", template.render()?);
+        let pet_id = pet.id;
+        let template = render_agent_timeline(state, household_id, Some(pet)).await?;
+        let mut html = as_refresh_template("timeline-refresh", template.render()?);
+        let events_count = db::list_events(&state.db, household_id, Some(pet_id), 50)
+            .await?
+            .len();
+        html.push_str(&as_refresh_template(
+            "events-refresh",
+            EventsMetricTemplate { events_count }.render()?,
+        ));
+        if refresh_latest_weight {
+            let latest_weight = db::list_weights(&state.db, household_id, pet_id)
+                .await?
+                .into_iter()
+                .next();
+            html.push_str(&as_refresh_template(
+                "latest-weight-header-refresh",
+                LatestWeightHeaderTemplate {
+                    latest_weight: latest_weight.clone(),
+                }
+                .render()?,
+            ));
+            html.push_str(&as_refresh_template(
+                "latest-weight-metric-refresh",
+                LatestWeightMetricTemplate { latest_weight }.render()?,
+            ));
+        }
         Ok((StatusCode::OK, Html(html)).into_response())
     } else {
         Ok(Redirect::to(&format!("/app?pet={}&view=timeline", pet.id)).into_response())
@@ -1674,22 +2119,113 @@ struct ConsoleTemplate {
     /// `{% include %}`: an include would inherit this struct's fields, forcing
     /// `ConsoleTemplate` to keep carrying every tab's data on every load.
     tab_html: String,
+    assistant_html: String,
     events_count: usize,
     latest_weight: Option<WeightEntry>,
     shares_count: usize,
     active_prescription_count: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AssistantTurn {
+    role: String,
+    content: String,
+}
+
+#[derive(Clone, Debug)]
+struct AssistantEvidence {
+    label: String,
+    detail: String,
+    href: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AssistantReply {
+    kind: String,
+    title: String,
+    answer: String,
+    evidence: Vec<AssistantEvidence>,
+    suggested_prompts: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "_assistant_workbench.html")]
+struct AssistantWorkbenchTemplate {
+    pet: Pet,
+    view_key: String,
+    view_label: String,
+    mode: String,
+    history_json: String,
+    turns: Vec<AssistantTurn>,
+    reply: Option<AssistantReply>,
+}
+
+#[derive(Template)]
+#[template(path = "_events_metric.html")]
+struct EventsMetricTemplate {
+    events_count: usize,
+}
+
+fn render_assistant_workbench(
+    pet: &Pet,
+    view: ConsoleView,
+    mode: &str,
+    turns: Vec<AssistantTurn>,
+    reply: Option<AssistantReply>,
+) -> Result<String, AppError> {
+    let history_json = serde_json::to_string(&turns)?;
+    Ok(AssistantWorkbenchTemplate {
+        pet: pet.clone(),
+        view_key: view.key().to_owned(),
+        view_label: view.label().to_owned(),
+        mode: mode.to_owned(),
+        history_json,
+        turns,
+        reply,
+    }
+    .render()?)
+}
+
+fn render_assistant_workbench_with_history(
+    pet: &Pet,
+    view: ConsoleView,
+    mode: &str,
+    display_turns: Vec<AssistantTurn>,
+    history_turns: Vec<AssistantTurn>,
+    reply: Option<AssistantReply>,
+) -> Result<String, AppError> {
+    let history_json = serde_json::to_string(&history_turns)?;
+    Ok(AssistantWorkbenchTemplate {
+        pet: pet.clone(),
+        view_key: view.key().to_owned(),
+        view_label: view.label().to_owned(),
+        mode: mode.to_owned(),
+        history_json,
+        turns: display_turns,
+        reply,
+    }
+    .render()?)
+}
+
+#[derive(Template)]
+#[template(path = "_latest_weight_header.html")]
+struct LatestWeightHeaderTemplate {
+    latest_weight: Option<WeightEntry>,
+}
+
+#[derive(Template)]
+#[template(path = "_latest_weight_metric.html")]
+struct LatestWeightMetricTemplate {
+    latest_weight: Option<WeightEntry>,
+}
+
 #[derive(Template)]
 #[template(path = "_tab_timeline.html")]
 struct TabTimelineTemplate {
-    selected_pet: Option<Pet>,
     pet_id: i64,
     days: Vec<TimelineDay>,
     entries_count: usize,
     next_cursor: Option<TimelineCursor>,
-    capture_message: Option<String>,
-    capture_error: Option<String>,
     /// `_tab_timeline.html` is just `{% include "_agent_timeline.html") %}`, so
     /// this struct must carry every field that template reads. See
     /// `_timeline_load_more.html`'s doc comment. Always `false` here.
@@ -1794,13 +2330,10 @@ struct AccountTemplate {
 #[derive(Template)]
 #[template(path = "_agent_timeline.html")]
 struct AgentTimelineTemplate {
-    selected_pet: Option<Pet>,
     pet_id: i64,
     days: Vec<TimelineDay>,
     entries_count: usize,
     next_cursor: Option<TimelineCursor>,
-    capture_message: Option<String>,
-    capture_error: Option<String>,
     /// See `_timeline_load_more.html`'s doc comment. Always `false` here —
     /// `render_agent_timeline` is the only place that constructs this
     /// template, and every one of its callers either swaps

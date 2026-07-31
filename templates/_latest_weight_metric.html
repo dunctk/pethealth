@@ -1,0 +1,1 @@
+<div id="latest-weight-metric"><small>LATEST WEIGHT</small><strong>{% match latest_weight %}{% when Some with (weight) %}{{ weight.weight_kg }} kg{% when None %}Not recorded{% endmatch %}</strong><span>{% match latest_weight %}{% when Some with (weight) %}{{ weight.measured_at }}{% when None %}Track it over time{% endmatch %}</span></div>

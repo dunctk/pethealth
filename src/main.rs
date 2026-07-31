@@ -18,6 +18,7 @@ pub struct AppState {
     pub db: sea_orm::DatabaseConnection,
     pub config: Arc<Config>,
     pub agent: Arc<agent::CaptureAgent>,
+    pub chat: Arc<agent::ChatAgent>,
 }
 
 #[tokio::main]
@@ -34,10 +35,12 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&database).await?;
     db::bootstrap_owner(&database, &config.username, &config.password).await?;
     let agent = Arc::new(agent::CaptureAgent::new(&config));
+    let chat = Arc::new(agent::ChatAgent::new(&config));
     let state = AppState {
         db: database,
         config: config.clone(),
         agent,
+        chat,
     };
 
     let app = web::router(state)

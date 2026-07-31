@@ -488,11 +488,40 @@ function highlightActiveTab(requestPath) {
     if (isActive) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
+  updateAssistantView(match[1]);
+}
+
+function updateAssistantView(viewKey) {
+  const workbench = document.querySelector("[data-assistant-workbench]");
+  if (!workbench) return;
+  const labels = { timeline: "Timeline", plan: "Plan", labs: "Labs", sharing: "Sharing" };
+  const label = labels[viewKey];
+  if (!label) return;
+  const viewInput = workbench.querySelector("[data-assistant-view-input]");
+  const viewLabel = workbench.querySelector("[data-assistant-view-label]");
+  if (viewInput) viewInput.value = viewKey;
+  if (viewLabel) viewLabel.textContent = label;
+}
+
+function markAssistantUndo() {
+  const reply = document.querySelector("[data-assistant-reply]");
+  const title = reply && reply.querySelector(".side-label");
+  if (reply && title && title.textContent.trim() === "RECORDED IN THE TIMELINE") {
+    reply.className = "assistant-reply clarification";
+    title.textContent = "EVENT UNDONE";
+    const answer = reply.querySelector("h3");
+    if (answer) answer.textContent = "Removed from the active timeline. Nothing else was changed.";
+    reply.querySelectorAll(".assistant-evidence, .assistant-suggestions").forEach((section) => section.remove());
+  }
 }
 
 document.addEventListener("htmx:afterSwap", (event) => {
   if (event.target && event.target.id === "tab-body") {
     highlightActiveTab(event.detail && event.detail.pathInfo && event.detail.pathInfo.requestPath);
+  }
+  const requestPath = event.detail && event.detail.pathInfo && event.detail.pathInfo.requestPath;
+  if (event.target && event.target.id === "agent-and-timeline" && /\/events\/\d+\/undo/.test(requestPath || "")) {
+    markAssistantUndo();
   }
 });
 
@@ -679,16 +708,58 @@ function applyManualRefresh(responseText, templateId, targetId) {
   }
 }
 
+// The copilot is one context-scoped composer with two bounded intents. Keep
+// the mode and example actions delegated so they continue working when the
+// assistant workbench is manually replaced after a response.
+document.addEventListener("click", (event) => {
+  const modeButton = event.target.closest("[data-assistant-mode]");
+  const example = event.target.closest("[data-assistant-example]");
+  if (!modeButton && !example) return;
+  const root = (modeButton || example).closest("[data-assistant-workbench]");
+  if (!root) return;
+  const mode = modeButton ? modeButton.dataset.assistantMode : example.dataset.assistantExampleMode || "ask";
+  const modeInput = root.querySelector("[data-assistant-mode-input]");
+  const input = root.querySelector("[data-assistant-input]");
+  if (modeInput) modeInput.value = mode;
+  root.querySelectorAll("[data-assistant-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.assistantMode === mode);
+  });
+  if (input) {
+    input.placeholder = mode === "ask" ? input.dataset.askPlaceholder : input.dataset.recordPlaceholder;
+    if (example) input.value = example.dataset.assistantExample || "";
+    input.focus();
+  }
+});
+
 // Closes the currently open dialog after a successful submit from inside it
 // (the weight/dose/symptom/lab forms, marked `data-dialog-form`), so the
 // user isn't left staring at a dialog whose form just saved. A failed submit
 // (4xx) leaves the dialog open with the validation message shown in its own
 // status area instead.
 document.addEventListener("htmx:afterRequest", (event) => {
-  const form = event.target.closest && event.target.closest("[data-dialog-form]");
-  if (!form || !event.detail.successful) return;
+  const requestTarget = event.target;
   const responseText = event.detail.xhr && event.detail.xhr.responseText;
+  const status = event.detail.xhr && event.detail.xhr.status;
+  const assistantForm = requestTarget.closest && requestTarget.closest("[data-assistant-form]");
+  if (assistantForm && (event.detail.successful || status === 422)) {
+    applyManualRefresh(responseText, "assistant-refresh", "assistant-workbench");
+    applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
+    applyManualRefresh(responseText, "events-refresh", "events-count-metric");
+    return;
+  }
+  const undoForm = requestTarget.closest && requestTarget.closest("[data-undo-form]");
+  if (undoForm && event.detail.successful) {
+    applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
+    applyManualRefresh(responseText, "events-refresh", "events-count-metric");
+    markAssistantUndo();
+    return;
+  }
+  const form = requestTarget.closest && requestTarget.closest("[data-dialog-form]");
+  if (!form || !event.detail.successful) return;
   applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
+  applyManualRefresh(responseText, "events-refresh", "events-count-metric");
+  applyManualRefresh(responseText, "latest-weight-header-refresh", "header-latest-weight");
+  applyManualRefresh(responseText, "latest-weight-metric-refresh", "latest-weight-metric");
   applyManualRefresh(responseText, "labs-refresh", "labs-tab");
   const dialog = form.closest("dialog");
   if (dialog && dialog.open) dialog.close();

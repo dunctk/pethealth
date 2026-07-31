@@ -1,19 +1,4 @@
 <section id="agent-and-timeline" class="agent-and-timeline">
-  {#- The plain capture input is the one fast path that stays always-on and
-      zero-click (UI_REDESIGN_PLAN.md §2.4, §3): it must not move behind
-      "+ Record". Everything else — weight, dose, lab, and the structured
-      symptom form that used to sit right below this as a `<details>` — now
-      lives behind "+ Record" (see the pet header in console.html and
-      `templates/_form_*.html`). -#}
-  <form class="agent-capture" hx-post="/agent/capture" hx-target="#agent-and-timeline" hx-swap="outerHTML" hx-indicator="#agent-thinking">
-    {% match selected_pet %}{% when Some with (pet) %}<input type="hidden" name="selected_pet_id" value="{{ pet.id }}">{% when None %}{% endmatch %}
-    <div class="agent-label"><span class="agent-orb">✦</span><span><b>Record an event</b><small>Write what happened in your own words</small></span><span id="agent-thinking" class="htmx-indicator">SAVING...</span></div>
-    <div class="capture-row"><label class="sr-only" for="message">Pet health observation</label><input id="message" name="message" required maxlength="1000" autocomplete="off" placeholder="She ate reasonably, but no medication was given this morning"><button class="send-button" type="submit" aria-label="Record observation">↑</button></div>
-    <div class="capture-help"><span>Your words are saved with the event.</span><span>Try: “She ate reasonably, but no medication was given this morning”</span></div>
-    {% match capture_message %}{% when Some with (message) %}<div class="capture-result success" role="status"><span>✓</span>{{ message }}</div>{% when None %}{% endmatch %}
-    {% match capture_error %}{% when Some with (message) %}<div class="capture-result error" role="alert"><span>!</span>{{ message }}</div>{% when None %}{% endmatch %}
-  </form>
-
   <section id="timeline-region" class="timeline-region" aria-live="polite">
     <div class="section-head"><div><span class="eyebrow">HEALTH HISTORY</span><h2>Timeline</h2></div><span>{{ entries_count }} entr{% if entries_count == 1 %}y{% else %}ies{% endif %}</span></div>
     {% if days.is_empty() %}

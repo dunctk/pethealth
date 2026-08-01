@@ -71,15 +71,16 @@ After the first successful publish, open the package settings on GitHub and set 
 
 ## Optional Rig agent
 
-Common health phrases are handled locally so capture remains available without a provider. Configure the following to let Rig structure observations outside the deterministic vocabulary:
+When configured, Rig is the first pass for every natural-language capture, so the record box can structure free-form observations instead of relying on fixed phrases. A small deterministic parser remains as a safe fallback for known phrases when the provider is unavailable or omitted:
 
 ```text
-LLM_API_KEY=...
-LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_MODEL=openai/gpt-4.1-mini
+OPENROUTER_API_KEY=...
+# Optional overrides:
+# LLM_BASE_URL=https://openrouter.ai/api/v1
+# LLM_MODEL=openai/gpt-5.6-sol
 ```
 
-`LLM_API_KEY` is an OpenRouter API key by default. The production compose file passes these three settings through to the container. The capture box also uses the selected pet when a note says “she”, “he”, or “they” without repeating the pet's name. A note saying no medication was given and appetite was reasonable is saved as a care update and marks the pet's active prescriptions as missed for that date.
+`OPENROUTER_API_KEY` is the preferred provider-specific name; `LLM_API_KEY` remains accepted for backwards compatibility. The base URL defaults to OpenRouter and the model defaults to `openai/gpt-5.6-sol`, so neither override is required. The production compose file passes both key names through to the container. The capture box also uses the selected pet when a note says “she”, “he”, or “they” without repeating the pet's name. A note saying no medication was given and appetite was reasonable is saved as a care update and marks the pet's active prescriptions as missed for that date.
 
 The model proposes a typed event only. Rust resolves the pet, validates the proposal, chooses the timestamp, and performs the tenant-scoped transaction.
 

@@ -1233,6 +1233,11 @@ async fn record_agent_event(
     } else {
         format!("Saved: {}", intent.event.summary)
     };
+    let capture_title = if intent.used_model {
+        "AI STRUCTURED THE EVENT"
+    } else {
+        "RECORDED IN THE TIMELINE"
+    };
     let mut history = parse_assistant_history(raw_history);
     let mut display_turns = history.clone();
     display_turns.push(AssistantTurn {
@@ -1247,15 +1252,23 @@ async fn record_agent_event(
         role: "assistant".into(),
         content: capture_message.clone(),
     });
+    let mut evidence = vec![AssistantEvidence {
+        label: "Original wording".into(),
+        detail: "saved with the event".into(),
+        href: Some(format!("/app?pet={}&view=timeline", pet.id)),
+    }];
+    if intent.used_model {
+        evidence.push(AssistantEvidence {
+            label: "AI classification".into(),
+            detail: format!("{} · {}", intent.event.event_type, intent.event.concept),
+            href: None,
+        });
+    }
     let reply = AssistantReply {
         kind: "answer".into(),
-        title: "RECORDED IN THE TIMELINE".into(),
+        title: capture_title.into(),
         answer: capture_message,
-        evidence: vec![AssistantEvidence {
-            label: "Original wording".into(),
-            detail: "saved with the event".into(),
-            href: Some(format!("/app?pet={}&view=timeline", pet.id)),
-        }],
+        evidence,
         suggested_prompts: vec![
             "Summarize the recent history".into(),
             "Prepare questions for our next vet visit".into(),

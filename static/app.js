@@ -506,7 +506,7 @@ function updateAssistantView(viewKey) {
 function markAssistantUndo() {
   const reply = document.querySelector("[data-assistant-reply]");
   const title = reply && reply.querySelector(".side-label");
-  if (reply && title && title.textContent.trim() === "RECORDED IN THE TIMELINE") {
+  if (reply && title && ["RECORDED IN THE TIMELINE", "AI STRUCTURED THE EVENT"].includes(title.textContent.trim())) {
     reply.className = "assistant-reply clarification";
     title.textContent = "EVENT UNDONE";
     const answer = reply.querySelector("h3");

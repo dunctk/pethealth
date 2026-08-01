@@ -50,10 +50,12 @@ impl Config {
             password,
             production,
             database_url,
-            llm_api_key: nonempty_env("LLM_API_KEY"),
-            llm_base_url: env::var("LLM_BASE_URL")
-                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned()),
-            llm_model: env::var("LLM_MODEL").unwrap_or_else(|_| "openai/gpt-4.1-mini".to_owned()),
+            // Prefer the provider-native name when both are present, while
+            // keeping the generic name for backwards compatibility.
+            llm_api_key: first_nonempty_env(&["OPENROUTER_API_KEY", "LLM_API_KEY"]),
+            llm_base_url: nonempty_env("LLM_BASE_URL")
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_owned()),
+            llm_model: nonempty_env("LLM_MODEL").unwrap_or_else(|| "openai/gpt-5.6-sol".to_owned()),
             llm_timeout_seconds: env::var("LLM_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|value| value.trim().parse().ok())
@@ -75,6 +77,10 @@ fn env_bool(key: &str) -> bool {
 
 fn nonempty_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn first_nonempty_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| nonempty_env(key))
 }
 
 #[cfg(test)]

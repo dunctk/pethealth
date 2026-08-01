@@ -1,7 +1,7 @@
 <section id="assistant-workbench" class="assistant-workbench" data-assistant-workbench aria-labelledby="assistant-title">
   <div class="assistant-head">
     <div class="assistant-title-wrap"><span class="assistant-orb" aria-hidden="true">✦</span><div><span class="side-label">PET RECORD COPILOT</span><h2 id="assistant-title">Ask or record</h2></div></div>
-    <span class="assistant-scope" data-assistant-view-scope><b>{{ pet.name }}</b> · <span data-assistant-view-label>{{ view_label }}</span> · read-first</span>
+    <span class="assistant-scope" data-assistant-view-scope><b>{{ pet.name }}</b> · <span data-assistant-view-label>{{ view_label }}</span> · {% if mode == "record" %}AI extraction · undoable{% else %}read-first{% endif %}</span>
   </div>
   <form method="post" action="/agent/chat" class="assistant-form" hx-post="/agent/chat" hx-swap="none" data-assistant-form>
     <input type="hidden" name="pet_id" value="{{ pet.id }}">
@@ -10,7 +10,7 @@
     <textarea name="history" hidden>{{ history_json }}</textarea>
     <div class="assistant-compose-row">
       <div class="assistant-mode-switch" role="group" aria-label="Copilot action">
-        <button type="button" class="assistant-mode {% if mode == "record" %}active{% endif %}" data-assistant-mode="record">Record</button>
+        <button type="button" class="assistant-mode {% if mode == "record" %}active{% endif %}" data-assistant-mode="record">AI record</button>
         <button type="button" class="assistant-mode {% if mode == "ask" %}active{% endif %}" data-assistant-mode="ask">Ask</button>
       </div>
       <label class="assistant-input-label" for="assistant-message"><span class="sr-only">What do you want to record or ask?</span><textarea id="assistant-message" name="message" required maxlength="1000" rows="1" data-assistant-input data-record-placeholder="Write what happened in your own words…" data-ask-placeholder="Ask about {{ pet.name }}’s record…" placeholder="{% if mode == "ask" %}Ask about {{ pet.name }}’s record…{% else %}Write what happened in your own words…{% endif %}"></textarea></label>
@@ -20,7 +20,7 @@
       <button type="button" data-assistant-example="{{ pet.name }} vomited just now" data-assistant-example-mode="record">Record an event</button>
       <button type="button" data-assistant-example="Summarize the recent history" data-assistant-example-mode="ask">Explain recent changes</button>
       <button type="button" data-assistant-example="Prepare questions for our next vet visit" data-assistant-example-mode="ask">Prepare for a vet visit</button>
-      <span class="assistant-contract">Records are saved with Undo · answers are context, not diagnosis</span>
+      <span class="assistant-contract">AI extracts structure · your words stay intact · Undo available <span class="assistant-processing" aria-live="polite">Interpreting note…</span></span>
     </div>
   </form>
 

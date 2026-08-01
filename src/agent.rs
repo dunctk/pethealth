@@ -15,6 +15,7 @@ pub struct CaptureAgent {
 pub struct CaptureIntent {
     pub event: ProposedEvent,
     pub missed_medication: bool,
+    pub used_model: bool,
 }
 
 #[derive(Clone)]
@@ -186,17 +187,66 @@ impl CaptureAgent {
         pet_names: &[String],
         selected_pet: Option<&str>,
     ) -> Result<CaptureIntent, CaptureError> {
-        if let Some(intent) = deterministic_proposal(input, pet_names, selected_pet)? {
+        // Resolve the pet before calling the model. This keeps the model from
+        // inventing a household member and gives pronouns a server-owned scope
+        // when the user is already inside a pet's record.
+        let resolved_pet = resolve_pet(input, pet_names, selected_pet)?;
+
+        if self.llm.is_some() {
+            match self
+                .propose_with_model(input, pet_names, selected_pet)
+                .await
+            {
+                Ok(mut intent) => {
+                    // The selected pet is authoritative when the note uses a
+                    // pronoun or an informal reference instead of a known pet
+                    // name. The model still extracts the event semantics.
+                    if !mentions_known_pet(input, pet_names) {
+                        intent.event.pet_name = resolved_pet;
+                    }
+                    // Keep this care workflow reliable even if a model omits
+                    // the boolean in an otherwise valid typed response.
+                    intent.missed_medication = mentions_missed_medication(&input.to_lowercase())
+                        && mentions_reasonable_appetite(&input.to_lowercase());
+                    intent.used_model = true;
+                    return Ok(intent);
+                }
+                Err(error @ (CaptureError::Model | CaptureError::ModelTimeout)) => {
+                    // A short, known phrase can still be recorded safely if
+                    // the provider is unavailable. Unknown prose should keep
+                    // the honest retry/clarification error instead of guessing.
+                    if let Some(mut intent) =
+                        deterministic_proposal(input, pet_names, selected_pet)?
+                    {
+                        intent.used_model = false;
+                        tracing::warn!(%error, "capture model unavailable; using deterministic fallback");
+                        return Ok(intent);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // No provider configured: retain the offline parser for local installs
+        // and make the missing AI configuration visible in the logs.
+        if let Some(mut intent) = deterministic_proposal(input, pet_names, selected_pet)? {
+            intent.used_model = false;
             return Ok(intent);
         }
+        tracing::info!(
+            "capture fell through to the deterministic parser with no model configured; set LLM_API_KEY to enable AI extraction"
+        );
+        Err(unsupported_example(pet_names, selected_pet))
+    }
+
+    async fn propose_with_model(
+        &self,
+        input: &str,
+        pet_names: &[String],
+        selected_pet: Option<&str>,
+    ) -> Result<CaptureIntent, CaptureError> {
         let Some(llm) = &self.llm else {
-            // No LLM_API_KEY, so the keyword ladder above is the whole extractor
-            // and it did not match. Say so in the log: from the outside this is
-            // indistinguishable from a model that ran and failed.
-            tracing::info!(
-                "capture fell through to the deterministic parser with no model configured; set LLM_API_KEY to enable extraction"
-            );
-            return Err(unsupported_example(pet_names, selected_pet));
+            unreachable!("propose_with_model is only called with a configured model");
         };
         let client = openai::Client::builder()
             .api_key(&llm.api_key)
@@ -238,9 +288,11 @@ impl CaptureAgent {
             CaptureError::Model
         })?;
         validate_pet(&proposal.pet_name, pet_names)?;
+        validate_proposal(&proposal)?;
         Ok(CaptureIntent {
             event: proposal,
             missed_medication: false,
+            used_model: true,
         })
     }
 
@@ -251,6 +303,29 @@ impl CaptureAgent {
     ) -> DateTime<Utc> {
         received_at - Duration::minutes(proposal.minutes_ago.unwrap_or(0).clamp(0, 525_600))
     }
+}
+
+fn mentions_known_pet(input: &str, pet_names: &[String]) -> bool {
+    let lower = input.to_lowercase();
+    pet_names.iter().any(|name| {
+        let escaped = regex::escape(&name.to_lowercase());
+        Regex::new(&format!(
+            r"(?:^|[^\p{{L}}\p{{N}}]){escaped}(?:$|[^\p{{L}}\p{{N}}])"
+        ))
+        .is_ok_and(|regex| regex.is_match(&lower))
+    })
+}
+
+fn validate_proposal(proposal: &ProposedEvent) -> Result<(), CaptureError> {
+    if !matches!(
+        proposal.event_type.as_str(),
+        "observation" | "symptom" | "medication" | "measurement" | "vet_visit"
+    ) || proposal.concept.trim().is_empty()
+        || proposal.summary.trim().is_empty()
+    {
+        return Err(CaptureError::Model);
+    }
+    Ok(())
 }
 
 fn deterministic_proposal(
@@ -273,6 +348,7 @@ fn deterministic_proposal(
                 minutes_ago: None,
             },
             missed_medication: true,
+            used_model: false,
         }));
     }
     let (event_type, concept, summary) = if contains_any(
@@ -306,6 +382,7 @@ fn deterministic_proposal(
             minutes_ago,
         },
         missed_medication: false,
+        used_model: false,
     }))
 }
 

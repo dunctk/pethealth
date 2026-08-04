@@ -102,6 +102,44 @@ pub struct MedicationPrescription {
     pub raw_input: Option<String>,
 }
 
+/// A structured medication-regimen change inferred from the owner's wording.
+/// This is a proposal only: the web layer must obtain explicit confirmation
+/// before it can become an active prescription or a timeline event.
+#[derive(Clone, Debug, Serialize)]
+pub struct MedicationPlanChange {
+    pub pet_name: String,
+    pub medication_name: String,
+    pub dose_value: f64,
+    pub dose_unit: String,
+    pub frequency: String,
+    pub reason: Option<String>,
+}
+
+impl MedicationPlanChange {
+    pub fn summary(&self) -> String {
+        format!(
+            "{}: {} {} {}",
+            self.medication_name, self.dose_value, self.dose_unit, self.frequency
+        )
+    }
+
+    pub fn as_event(&self) -> ProposedEvent {
+        let details = self
+            .reason
+            .as_deref()
+            .map(|reason| format!("Medication plan change. Reason/context: {reason}"))
+            .or_else(|| Some("Medication plan change.".to_owned()));
+        ProposedEvent {
+            pet_name: self.pet_name.clone(),
+            event_type: "medication".into(),
+            concept: "medication_plan_change".into(),
+            summary: self.summary(),
+            details,
+            minutes_ago: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MedicationAdherence {
     pub id: i64,

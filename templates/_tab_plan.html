@@ -34,14 +34,14 @@
     <div class="side-label">DOSE GAPS</div>
     <h3>Adherence</h3>
     <p>What actually happened against the plan above.</p>
-    {% if prescriptions.is_empty() %}
+    {% if active_prescriptions.is_empty() %}
     <p class="tracker-empty">Add a prescription above before recording dose status.</p>
     {% else %}
     <details class="plan-add">
       <summary><span class="structured-pulse">+</span><span><b>Record dose status</b><small>Given, partial, or missed</small></span></summary>
       <form method="post" action="/medication-adherence" class="tracker-form">
         <input type="hidden" name="pet_id" value="{{ pet.id }}">
-        <label>Prescription<select required name="prescription_id">{% for prescription in prescriptions %}<option value="{{ prescription.id }}">{{ prescription.name }}</option>{% endfor %}</select></label>
+        <label>Prescription<select required name="prescription_id">{% for prescription in active_prescriptions %}<option value="{{ prescription.id }}">{{ prescription.name }}</option>{% endfor %}</select></label>
         <label>Date<input required type="date" name="scheduled_for"></label>
         <label>Status<select required name="status"><option value="partial">Partial dose</option><option value="missed">Missed / not eaten</option><option value="given">Taken as prescribed</option><option value="unknown">Not sure</option></select></label>
         <label>Actual dose <span class="field-hint">optional</span><input type="number" min="0" step="0.001" name="actual_dose_value" placeholder="0.5"></label>

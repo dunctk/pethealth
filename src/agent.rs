@@ -1,4 +1,7 @@
-use crate::{config::Config, domain::ProposedEvent};
+use crate::{
+    config::Config,
+    domain::{MedicationPlanChange, ProposedEvent},
+};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use rig_core::providers::openai;
@@ -14,6 +17,7 @@ pub struct CaptureAgent {
 #[derive(Clone, Debug)]
 pub struct CaptureIntent {
     pub event: ProposedEvent,
+    pub medication_plan_change: Option<MedicationPlanChange>,
     pub missed_medication: bool,
     pub used_model: bool,
 }
@@ -142,6 +146,10 @@ pub enum CaptureError {
     Unsupported { example: String },
     #[error("The configured language model could not parse that observation.")]
     Model,
+    #[error(
+        "I found a possible medication-plan change, but I need the medication, dose, and frequency before I can prepare it for confirmation."
+    )]
+    MedicationPlanNeedsDetails,
     #[error("The language model did not answer in time. Nothing was saved — try again.")]
     ModelTimeout,
 }
@@ -191,6 +199,17 @@ impl CaptureAgent {
         // inventing a household member and gives pronouns a server-owned scope
         // when the user is already inside a pet's record.
         let resolved_pet = resolve_pet(input, pet_names, selected_pet)?;
+        // Medication-plan changes are consequential and must never pass through
+        // the ordinary event-write path. A complete, high-confidence parse is
+        // staged for human review before any database write happens.
+        if let Some(change) = medication_plan_change(input, &resolved_pet) {
+            return Ok(CaptureIntent {
+                event: change.as_event(),
+                medication_plan_change: Some(change),
+                missed_medication: false,
+                used_model: false,
+            });
+        }
 
         if self.llm.is_some() {
             match self
@@ -203,6 +222,9 @@ impl CaptureAgent {
                     // name. The model still extracts the event semantics.
                     if !mentions_known_pet(input, pet_names) {
                         intent.event.pet_name = resolved_pet;
+                    }
+                    if intent.event.concept == "medication_plan_change" {
+                        return Err(CaptureError::MedicationPlanNeedsDetails);
                     }
                     // Keep this care workflow reliable even if a model omits
                     // the boolean in an otherwise valid typed response.
@@ -257,7 +279,7 @@ impl CaptureAgent {
                 CaptureError::Model
             })?;
         let prompt = format!(
-            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. \
+            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. If the input contains a medication name with a dose and frequency, classify the primary event as a medication plan change; any symptom after because, due to, or since is reason/context and must not replace the medication event. \
              event_type must be one of observation, symptom, medication, measurement, vet_visit. \
              concept is a short lowercase canonical phrase. Preserve factual medication absence and appetite wording in details. Do not invent a medicine, dose, diagnosis, or timestamp. minutes_ago is only for explicit relative time. Input: {}",
             pet_names.join(", "),
@@ -291,6 +313,7 @@ impl CaptureAgent {
         validate_proposal(&proposal)?;
         Ok(CaptureIntent {
             event: proposal,
+            medication_plan_change: None,
             missed_medication: false,
             used_model: true,
         })
@@ -347,6 +370,7 @@ fn deterministic_proposal(
                 ),
                 minutes_ago: None,
             },
+            medication_plan_change: None,
             missed_medication: true,
             used_model: false,
         }));
@@ -381,9 +405,54 @@ fn deterministic_proposal(
             details,
             minutes_ago,
         },
+        medication_plan_change: None,
         missed_medication: false,
         used_model: false,
     }))
+}
+
+fn medication_plan_change(input: &str, pet_name: &str) -> Option<MedicationPlanChange> {
+    let dose = Regex::new(
+        r"(?ix)\b(?:give|giving|change\s+to|switch\s+to|use)\s+(?:just\s+)?(\d+(?:[.,]\d+)?)\s*(ml|milliliters?|mg|grams?|g)\s+([[:alpha:]][[:alnum:]_-]*)",
+    )
+    .ok()?
+    .captures(input)?;
+    let value = dose.get(1)?.as_str().replace(',', ".").parse().ok()?;
+    let unit = dose.get(2)?.as_str().to_lowercase();
+    let name = dose.get(3)?.as_str().to_owned();
+    let lower = input.to_lowercase();
+    let frequency = if Regex::new(r"(?i)\b(?:1x|once|one)\s+(?:per|a)\s+day\b")
+        .ok()?
+        .is_match(&lower)
+    {
+        "once daily"
+    } else if Regex::new(r"(?i)\b(?:daily|every\s+day|q24h)\b")
+        .ok()?
+        .is_match(&lower)
+    {
+        "daily"
+    } else {
+        return None;
+    };
+    let normalized_unit = match unit.as_str() {
+        "ml" | "milliliter" | "milliliters" => "mL",
+        "gram" | "grams" => "g",
+        _ => unit.as_str(),
+    };
+    let reason = Regex::new(r"(?is)\b(?:because|due\s+to|since)\b\s+(.+?)\s*[.!?]*\s*$")
+        .ok()?
+        .captures(input)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().trim().to_owned())
+        .filter(|value| !value.is_empty());
+    Some(MedicationPlanChange {
+        pet_name: pet_name.to_owned(),
+        medication_name: name,
+        dose_value: value,
+        dose_unit: normalized_unit.to_owned(),
+        frequency: frequency.to_owned(),
+        reason,
+    })
 }
 
 fn resolve_pet(
@@ -536,6 +605,32 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("reasonable amount")
+        );
+    }
+
+    #[tokio::test]
+    async fn prioritizes_medication_plan_over_symptom_context_without_a_model() {
+        let agent = CaptureAgent { llm: None };
+        let result = agent
+            .propose_capture(
+                "deciding to change to just give 0.25ml Apelka 1x per day because she has been throwing up before",
+                &["Velcro".into()],
+                Some("Velcro"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.event.pet_name, "Velcro");
+        assert_eq!(result.event.event_type, "medication");
+        assert_eq!(result.event.concept, "medication_plan_change");
+        assert_eq!(result.event.summary, "Apelka: 0.25 mL once daily");
+        let change = result.medication_plan_change.unwrap();
+        assert_eq!(change.medication_name, "Apelka");
+        assert_eq!(change.dose_value, 0.25);
+        assert_eq!(change.dose_unit, "mL");
+        assert_eq!(change.frequency, "once daily");
+        assert_eq!(
+            change.reason.as_deref(),
+            Some("she has been throwing up before")
         );
     }
 

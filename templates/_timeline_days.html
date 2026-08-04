@@ -11,6 +11,20 @@
   <div class="event-body">
     <div class="event-meta"><span class="type {{ event.tone }}">{{ event.event_type }}</span><time datetime="{{ event.occurred_at.to_rfc3339() }}">{{ event.occurred_label }}</time></div>
     <h3>{{ event.summary }}</h3><p>“{{ event.raw_input }}”</p>
+    <details class="event-label-editor">
+      <summary>Edit label</summary>
+      <form data-label-edit-form hx-post="/events/{{ event.id }}/summary" hx-swap="none">
+        <input type="hidden" name="pet_id" value="{{ event.pet_id }}">
+        <label for="event-label-{{ event.id }}">Timeline label</label>
+        <div class="event-label-fields">
+          <input id="event-label-{{ event.id }}" name="summary" value="{{ event.summary }}" maxlength="120" required autocomplete="off">
+          <button class="button" type="submit">Save</button>
+          <button class="quiet-action" type="button" data-label-edit-cancel>Cancel</button>
+        </div>
+        <small class="event-label-note">Only this label changes. Your original words stay with the event.</small>
+        <div class="event-label-status" role="status" aria-live="polite"></div>
+      </form>
+    </details>
     {% match event.details %}{% when Some with (details) %}<small>{{ details }}</small>{% when None %}{% endmatch %}
     {% match event.symptom %}
     {% when Some with (symptom) %}

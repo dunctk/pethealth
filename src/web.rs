@@ -534,12 +534,17 @@ async fn index(
     let mut assistant_html = String::new();
     let mut events_count = 0;
     let mut latest_weight = None;
+    let mut header_weight_kg = None;
     let mut shares_count = 0;
     let mut active_prescription_count = 0;
     if let Some(pet) = &selected_pet {
         let data = load_console_data(&state, user.household_id, pet.id).await?;
         events_count = data.events.len();
         latest_weight = data.weights.first().cloned();
+        header_weight_kg = latest_weight
+            .as_ref()
+            .map(|weight| weight.weight_kg)
+            .or(pet.weight_kg);
         shares_count = data.shares.len();
         active_prescription_count = data
             .prescriptions
@@ -558,6 +563,7 @@ async fn index(
         assistant_html,
         events_count,
         latest_weight,
+        header_weight_kg,
         shares_count,
         active_prescription_count,
     })
@@ -2164,6 +2170,7 @@ async fn timeline_write_response(
 ) -> Result<Response, AppError> {
     if wants_fragment(headers) {
         let pet_id = pet.id;
+        let profile_weight_kg = pet.weight_kg;
         let template = render_agent_timeline(state, household_id, Some(pet)).await?;
         let mut html = as_refresh_template("timeline-refresh", template.render()?);
         let events_count = db::list_events(&state.db, household_id, Some(pet_id), 50)
@@ -2181,7 +2188,10 @@ async fn timeline_write_response(
             html.push_str(&as_refresh_template(
                 "latest-weight-header-refresh",
                 LatestWeightHeaderTemplate {
-                    latest_weight: latest_weight.clone(),
+                    header_weight_kg: latest_weight
+                        .as_ref()
+                        .map(|weight| weight.weight_kg)
+                        .or(profile_weight_kg),
                 }
                 .render()?,
             ));
@@ -2388,6 +2398,7 @@ struct ConsoleTemplate {
     assistant_html: String,
     events_count: usize,
     latest_weight: Option<WeightEntry>,
+    header_weight_kg: Option<f64>,
     shares_count: usize,
     active_prescription_count: usize,
 }
@@ -2488,7 +2499,7 @@ fn render_assistant_workbench_with_history(
 #[derive(Template)]
 #[template(path = "_latest_weight_header.html")]
 struct LatestWeightHeaderTemplate {
-    latest_weight: Option<WeightEntry>,
+    header_weight_kg: Option<f64>,
 }
 
 #[derive(Template)]

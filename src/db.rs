@@ -1072,6 +1072,35 @@ pub async fn create_pet(
         &now,
     )
     .await?;
+    if let Some(weight_kg) = weight_kg {
+        let weight_row = transaction
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO weight_entries(household_id,pet_id,weight_kg,measured_at,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+                [
+                    household_id.into(),
+                    id.into(),
+                    weight_kg.into(),
+                    now.clone().into(),
+                    "Initial weight".into(),
+                    now.clone().into(),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| anyhow!("initial weight insert returned no id"))?;
+        let weight_id: i64 = weight_row.try_get("", "id")?;
+        audit(
+            &transaction,
+            household_id,
+            actor,
+            "weight.created",
+            "weight_entry",
+            weight_id,
+            &format!("{weight_kg:.2} kg"),
+            &now,
+        )
+        .await?;
+    }
     transaction.commit().await?;
     Ok(id)
 }
@@ -2438,6 +2467,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn pet_initial_weight_is_also_a_timeline_weight_record() {
+        let db = test_db().await;
+        let pet_id = create_pet(
+            &db,
+            1,
+            "user:1",
+            "Velcro",
+            "Cat",
+            Some("Domestic Shorthair"),
+            Some(3.2),
+        )
+        .await
+        .unwrap();
+
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        assert_eq!(pet.weight_kg, Some(3.2));
+        let weights = list_weights(&db, 1, pet_id).await.unwrap();
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].weight_kg, 3.2);
+        assert_eq!(weights[0].note.as_deref(), Some("Initial weight"));
     }
 
     #[tokio::test]

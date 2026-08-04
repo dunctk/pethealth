@@ -73,7 +73,7 @@
         {% include "_events_metric.html" %}
         {% include "_latest_weight_metric.html" %}
         <div><small>VET LINKS</small><strong>{{ shares_count }}</strong><span>shared with your vet</span></div>
-        <a class="metric-link" href="/app?pet={{ pet.id }}&amp;view=plan"><small>ACTIVE PRESCRIPTIONS</small><strong>{{ active_prescription_count }}</strong><span>see the plan</span></a>
+        {% include "_active_prescriptions_metric.html" %}
       </section>
       <nav class="tab-bar" aria-label="Pet record sections">
         <a class="tab-link {% if view.is_timeline() %}active{% endif %}" {% if view.is_timeline() %}aria-current="page"{% endif %} href="/app?pet={{ pet.id }}&amp;view=timeline" hx-get="/app/tab/timeline?pet={{ pet.id }}" hx-target="#tab-body" hx-swap="innerHTML" hx-push-url="/app?pet={{ pet.id }}&amp;view=timeline">Timeline</a>

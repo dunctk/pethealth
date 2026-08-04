@@ -712,6 +712,28 @@ function applyManualRefresh(responseText, templateId, targetId) {
 // the mode and example actions delegated so they continue working when the
 // assistant workbench is manually replaced after a response.
 document.addEventListener("click", (event) => {
+  const cancelMedicationChange = event.target.closest("[data-cancel-medication-change]");
+  if (cancelMedicationChange) {
+    const review = cancelMedicationChange.closest("[data-medication-change-review]");
+    const root = cancelMedicationChange.closest("[data-assistant-workbench]");
+    if (review) {
+      review.className = "assistant-reply clarification";
+      review.innerHTML = '<div class="assistant-reply-head"><span class="assistant-reply-mark" aria-hidden="true">×</span><div><span class="side-label">PLAN CHANGE CANCELLED</span><h3>No changes were saved.</h3></div></div>';
+    }
+    const history = root && root.querySelector('textarea[name="history"]');
+    if (history) {
+      try {
+        const turns = JSON.parse(history.value);
+        if (Array.isArray(turns) && turns.at(-1)?.role === "user") turns.pop();
+        history.value = JSON.stringify(turns);
+      } catch (_) {
+        history.value = "[]";
+      }
+    }
+    const input = root && root.querySelector("[data-assistant-input]");
+    if (input) input.focus();
+    return;
+  }
   const modeButton = event.target.closest("[data-assistant-mode]");
   const example = event.target.closest("[data-assistant-example]");
   if (!modeButton && !example) return;
@@ -745,6 +767,8 @@ document.addEventListener("htmx:afterRequest", (event) => {
     applyManualRefresh(responseText, "assistant-refresh", "assistant-workbench");
     applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
     applyManualRefresh(responseText, "events-refresh", "events-count-metric");
+    applyManualRefresh(responseText, "active-prescriptions-refresh", "active-prescriptions-metric");
+    applyManualRefresh(responseText, "tab-refresh", "tab-body");
     return;
   }
   const undoForm = requestTarget.closest && requestTarget.closest("[data-undo-form]");
@@ -752,6 +776,16 @@ document.addEventListener("htmx:afterRequest", (event) => {
     applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
     applyManualRefresh(responseText, "events-refresh", "events-count-metric");
     markAssistantUndo();
+    return;
+  }
+  const labelForm = requestTarget.closest && requestTarget.closest("[data-label-edit-form]");
+  if (labelForm) {
+    if (event.detail.successful) {
+      applyManualRefresh(responseText, "timeline-refresh", "agent-and-timeline");
+    } else {
+      const statusRegion = labelForm.querySelector(".event-label-status");
+      if (statusRegion) statusRegion.innerHTML = responseText || "The label could not be saved.";
+    }
     return;
   }
   const form = requestTarget.closest && requestTarget.closest("[data-dialog-form]");
@@ -763,6 +797,29 @@ document.addEventListener("htmx:afterRequest", (event) => {
   applyManualRefresh(responseText, "labs-refresh", "labs-tab");
   const dialog = form.closest("dialog");
   if (dialog && dialog.open) dialog.close();
+});
+
+document.addEventListener("click", (event) => {
+  const cancel = event.target.closest("[data-label-edit-cancel]");
+  if (!cancel) return;
+  const editor = cancel.closest(".event-label-editor");
+  if (editor) {
+    const form = editor.querySelector("[data-label-edit-form]");
+    if (form) form.reset();
+    editor.open = false;
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const editor = event.target.closest && event.target.closest(".event-label-editor[open]");
+  if (editor) {
+    const form = editor.querySelector("[data-label-edit-form]");
+    if (form) form.reset();
+    editor.open = false;
+    const summary = editor.querySelector("summary");
+    if (summary) summary.focus();
+  }
 });
 
 // htmx 2 does not swap 4xx responses: its default `responseHandling` marks

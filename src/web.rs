@@ -4,7 +4,8 @@ use crate::{
     auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
-        MedicationPrescription, Pet, ShareGrant, TimelineEntry, UserAccount, WeightEntry,
+        MedicationPlanChange, MedicationPrescription, Pet, ShareGrant, TimelineEntry, UserAccount,
+        WeightEntry,
     },
     ocr,
 };
@@ -42,7 +43,12 @@ pub fn router(state: AppState) -> Router {
         .route("/blood-tests/import", post(import_blood_tests))
         .route("/agent/capture", post(capture))
         .route("/agent/chat", post(agent_chat))
+        .route(
+            "/agent/medication-plan/confirm",
+            post(confirm_agent_medication_plan),
+        )
         .route("/events/{id}/undo", post(undo_event))
+        .route("/events/{id}/summary", post(update_event_summary))
         .route("/shares", post(create_share))
         .route("/shares/{id}/revoke", post(revoke_share))
         .route("/account", get(account_page))
@@ -479,9 +485,16 @@ async fn render_tab_from_data(
         ConsoleView::Plan => {
             let adherence = db::list_adherence(&state.db, household_id, pet.id, 30).await?;
             let medications = db::list_medications(&state.db, household_id, pet.id, 20).await?;
+            let active_prescriptions = data
+                .prescriptions
+                .iter()
+                .filter(|prescription| prescription.status == "active")
+                .cloned()
+                .collect();
             TabPlanTemplate {
                 pet: pet.clone(),
                 prescriptions: data.prescriptions,
+                active_prescriptions,
                 adherence,
                 medications,
                 weights: data.weights,
@@ -521,19 +534,24 @@ async fn index(
     let mut assistant_html = String::new();
     let mut events_count = 0;
     let mut latest_weight = None;
+    let mut header_weight_kg = None;
     let mut shares_count = 0;
     let mut active_prescription_count = 0;
     if let Some(pet) = &selected_pet {
         let data = load_console_data(&state, user.household_id, pet.id).await?;
         events_count = data.events.len();
         latest_weight = data.weights.first().cloned();
+        header_weight_kg = latest_weight
+            .as_ref()
+            .map(|weight| weight.weight_kg)
+            .or(pet.weight_kg);
         shares_count = data.shares.len();
         active_prescription_count = data
             .prescriptions
             .iter()
             .filter(|item| item.status == "active")
             .count();
-        assistant_html = render_assistant_workbench(pet, view, "record", Vec::new(), None)?;
+        assistant_html = render_assistant_workbench(pet, view, "record", Vec::new(), None, None)?;
         tab_html = render_tab_from_data(&state, user.household_id, pet, view, data).await?;
     }
     render(&ConsoleTemplate {
@@ -545,6 +563,7 @@ async fn index(
         assistant_html,
         events_count,
         latest_weight,
+        header_weight_kg,
         shares_count,
         active_prescription_count,
     })
@@ -1114,6 +1133,28 @@ struct ChatForm {
     history: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ConfirmMedicationPlanForm {
+    pet_id: i64,
+    view: Option<String>,
+    history: Option<String>,
+    confirmation_token: String,
+    medication_name: String,
+    dose_value: f64,
+    dose_unit: String,
+    frequency: String,
+    reason: Option<String>,
+    raw_input: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMedicationChange {
+    change: MedicationPlanChange,
+    raw_input: String,
+    confirmation_token: String,
+    replaces_existing: bool,
+}
+
 async fn capture(
     State(state): State<AppState>,
     Extension(user): Extension<UserAccount>,
@@ -1154,6 +1195,149 @@ async fn agent_chat(
     answer_agent_chat(&state, &user, &headers, form, view).await
 }
 
+async fn confirm_agent_medication_plan(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
+    Form(form): Form<ConfirmMedicationPlanForm>,
+) -> Result<Response, AppError> {
+    let view = ConsoleView::parse(form.view.as_deref());
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let medication_name = clean_required(&form.medication_name, 120, "Medication")?;
+    if !form.dose_value.is_finite() || form.dose_value <= 0.0 || form.dose_value > 100_000.0 {
+        return Err(AppError::validation(
+            "Enter a valid dose greater than zero.",
+        ));
+    }
+    let dose_unit = clean_required(&form.dose_unit, 30, "Dose unit")?;
+    let frequency = clean_required(&form.frequency, 80, "Frequency")?;
+    let reason = clean_optional(form.reason.as_deref(), 500);
+    let raw_input = clean_required(&form.raw_input, 1000, "Original wording")?;
+    let confirmation_token = clean_required(&form.confirmation_token, 128, "Confirmation")?;
+    if confirmation_token.len() < 32
+        || !confirmation_token
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric())
+    {
+        return Err(AppError::validation(
+            "That confirmation has expired. Try the note again.",
+        ));
+    }
+
+    let result = db::confirm_medication_plan_change(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        &auth::token_hash(confirmation_token),
+        medication_name,
+        form.dose_value,
+        dose_unit,
+        frequency,
+        reason,
+        raw_input,
+    )
+    .await?;
+
+    let summary = format!(
+        "{medication_name}: {} {dose_unit} {frequency}",
+        form.dose_value
+    );
+    let answer = if result.already_applied {
+        format!("Already confirmed: {summary}. No duplicate plan was created.")
+    } else if result.replaced_prescriptions > 0 {
+        format!(
+            "Confirmed: {summary}. The previous active {medication_name} plan was marked stopped."
+        )
+    } else {
+        format!(
+            "Confirmed: {summary} is now active in {}’s medication plan.",
+            pet.name
+        )
+    };
+    let mut evidence = vec![
+        AssistantEvidence {
+            label: "Human approval".into(),
+            detail: "confirmed before changing the plan".into(),
+            href: Some(format!("/app?pet={}&view=plan", pet.id)),
+        },
+        AssistantEvidence {
+            label: "Original wording".into(),
+            detail: "saved with the plan and timeline event".into(),
+            href: Some(format!("/app?pet={}&view=timeline", pet.id)),
+        },
+    ];
+    if let Some(reason) = reason {
+        evidence.push(AssistantEvidence {
+            label: "Reason/context".into(),
+            detail: reason.to_owned(),
+            href: None,
+        });
+    }
+    let reply = AssistantReply {
+        kind: "answer".into(),
+        title: "MEDICATION PLAN CONFIRMED".into(),
+        answer: answer.clone(),
+        evidence,
+        suggested_prompts: vec![
+            "Show the current medication plan".into(),
+            "Prepare questions for our next vet visit".into(),
+        ],
+    };
+    let display_turns = parse_assistant_history(form.history.as_deref());
+    let mut stored_history = display_turns.clone();
+    stored_history.push(AssistantTurn {
+        role: "assistant".into(),
+        content: answer,
+    });
+    let assistant_html = render_assistant_workbench_with_history(
+        &pet,
+        view,
+        "record",
+        display_turns,
+        stored_history,
+        Some(reply),
+        None,
+    )?;
+    let timeline = render_agent_timeline(&state, user.household_id, Some(pet.clone())).await?;
+    let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
+        .await?
+        .len();
+    let data = load_console_data(&state, user.household_id, pet.id).await?;
+    let active_prescription_count = data
+        .prescriptions
+        .iter()
+        .filter(|item| item.status == "active")
+        .count();
+    let tab_refresh = if view.is_plan() {
+        let tab_html = render_tab_from_data(&state, user.household_id, &pet, view, data).await?;
+        Some(as_refresh_template(
+            "tab-refresh",
+            format!(r#"<div id="tab-body" class="tab-body">{tab_html}</div>"#),
+        ))
+    } else {
+        None
+    };
+    let mut extra_html = ActivePrescriptionsMetricTemplate {
+        pet: pet.clone(),
+        active_prescription_count,
+    }
+    .render()
+    .map(|html| as_refresh_template("active-prescriptions-refresh", html))?;
+    if let Some(tab_refresh) = tab_refresh {
+        extra_html.push_str(&tab_refresh);
+    }
+    assistant_fragment_response(
+        &headers,
+        assistant_html,
+        Some(timeline.render()?),
+        Some(events_count),
+        Some(extra_html),
+    )
+}
+
 async fn record_agent_event(
     state: &AppState,
     user: &UserAccount,
@@ -1189,6 +1373,37 @@ async fn record_agent_event(
     let pet = db::find_pet_by_name(&state.db, user.household_id, &intent.event.pet_name)
         .await?
         .ok_or_else(|| AppError::validation("That pet no longer exists."))?;
+    if let Some(change) = intent.medication_plan_change {
+        let prescriptions =
+            db::list_prescriptions(&state.db, user.household_id, pet.id, 100).await?;
+        let replaces_existing = prescriptions.iter().any(|prescription| {
+            prescription.status == "active"
+                && prescription
+                    .name
+                    .eq_ignore_ascii_case(&change.medication_name)
+        });
+        let mut history = parse_assistant_history(raw_history);
+        history.push(AssistantTurn {
+            role: "user".into(),
+            content: message.clone(),
+        });
+        let pending = PendingMedicationChange {
+            change,
+            raw_input: message,
+            confirmation_token: auth::new_action_token(),
+            replaces_existing,
+        };
+        let assistant_html = render_assistant_workbench_with_history(
+            &pet,
+            view,
+            "record",
+            history.clone(),
+            history,
+            None,
+            Some(pending),
+        )?;
+        return assistant_fragment_response(&headers, assistant_html, None, None, None);
+    }
     let received_at = Utc::now();
     let occurred_at = state.agent.occurred_at(&intent.event, received_at);
     db::create_health_event(
@@ -1281,6 +1496,7 @@ async fn record_agent_event(
         display_turns,
         history,
         Some(reply),
+        None,
     )?;
     let timeline = render_agent_timeline(state, user.household_id, Some(pet.clone())).await?;
     let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
@@ -1291,6 +1507,7 @@ async fn record_agent_event(
         assistant_html,
         Some(timeline.render()?),
         Some(events_count),
+        None,
     )
 }
 
@@ -1354,8 +1571,9 @@ async fn answer_agent_chat(
         display_turns,
         stored_history,
         Some(reply),
+        None,
     )?;
-    assistant_fragment_response(headers, assistant_html, None, None)
+    assistant_fragment_response(headers, assistant_html, None, None, None)
 }
 
 fn assistant_error_response(
@@ -1385,6 +1603,7 @@ fn assistant_error_response(
         history.clone(),
         history,
         Some(reply),
+        None,
     )?;
     let response = as_refresh_template("assistant-refresh", html);
     if !wants_fragment(headers) {
@@ -1398,6 +1617,7 @@ fn assistant_fragment_response(
     assistant_html: String,
     timeline_html: Option<String>,
     events_count: Option<usize>,
+    extra_html: Option<String>,
 ) -> Result<Response, AppError> {
     if !wants_fragment(headers) {
         return Ok(Redirect::to("/app").into_response());
@@ -1411,6 +1631,9 @@ fn assistant_fragment_response(
             "events-refresh",
             EventsMetricTemplate { events_count }.render()?,
         ));
+    }
+    if let Some(extra_html) = extra_html {
+        html.push_str(&extra_html);
     }
     Ok((StatusCode::OK, Html(html)).into_response())
 }
@@ -1654,6 +1877,42 @@ async fn undo_event(
         EventsMetricTemplate { events_count }.render()?,
     ));
     Ok(Html(html))
+}
+
+#[derive(Deserialize)]
+struct EventSummaryForm {
+    pet_id: i64,
+    summary: String,
+}
+
+async fn update_event_summary(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Path(id): Path<i64>,
+    Form(form): Form<EventSummaryForm>,
+) -> Result<Html<String>, AppError> {
+    let summary = clean_required(&form.summary, 120, "Label")?;
+    let updated = db::update_event_summary(
+        &state.db,
+        user.household_id,
+        form.pet_id,
+        &user.audit_actor(),
+        id,
+        summary,
+    )
+    .await?;
+    if !updated {
+        return Err(AppError::not_found());
+    }
+
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let timeline = render_agent_timeline(&state, user.household_id, Some(pet)).await?;
+    Ok(Html(as_refresh_template(
+        "timeline-refresh",
+        timeline.render()?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -1911,6 +2170,7 @@ async fn timeline_write_response(
 ) -> Result<Response, AppError> {
     if wants_fragment(headers) {
         let pet_id = pet.id;
+        let profile_weight_kg = pet.weight_kg;
         let template = render_agent_timeline(state, household_id, Some(pet)).await?;
         let mut html = as_refresh_template("timeline-refresh", template.render()?);
         let events_count = db::list_events(&state.db, household_id, Some(pet_id), 50)
@@ -1928,7 +2188,10 @@ async fn timeline_write_response(
             html.push_str(&as_refresh_template(
                 "latest-weight-header-refresh",
                 LatestWeightHeaderTemplate {
-                    latest_weight: latest_weight.clone(),
+                    header_weight_kg: latest_weight
+                        .as_ref()
+                        .map(|weight| weight.weight_kg)
+                        .or(profile_weight_kg),
                 }
                 .render()?,
             ));
@@ -2135,6 +2398,7 @@ struct ConsoleTemplate {
     assistant_html: String,
     events_count: usize,
     latest_weight: Option<WeightEntry>,
+    header_weight_kg: Option<f64>,
     shares_count: usize,
     active_prescription_count: usize,
 }
@@ -2171,6 +2435,7 @@ struct AssistantWorkbenchTemplate {
     history_json: String,
     turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
+    pending_medication_change: Option<PendingMedicationChange>,
 }
 
 #[derive(Template)]
@@ -2179,12 +2444,20 @@ struct EventsMetricTemplate {
     events_count: usize,
 }
 
+#[derive(Template)]
+#[template(path = "_active_prescriptions_metric.html")]
+struct ActivePrescriptionsMetricTemplate {
+    pet: Pet,
+    active_prescription_count: usize,
+}
+
 fn render_assistant_workbench(
     pet: &Pet,
     view: ConsoleView,
     mode: &str,
     turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
+    pending_medication_change: Option<PendingMedicationChange>,
 ) -> Result<String, AppError> {
     let history_json = serde_json::to_string(&turns)?;
     Ok(AssistantWorkbenchTemplate {
@@ -2195,6 +2468,7 @@ fn render_assistant_workbench(
         history_json,
         turns,
         reply,
+        pending_medication_change,
     }
     .render()?)
 }
@@ -2206,6 +2480,7 @@ fn render_assistant_workbench_with_history(
     display_turns: Vec<AssistantTurn>,
     history_turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
+    pending_medication_change: Option<PendingMedicationChange>,
 ) -> Result<String, AppError> {
     let history_json = serde_json::to_string(&history_turns)?;
     Ok(AssistantWorkbenchTemplate {
@@ -2216,6 +2491,7 @@ fn render_assistant_workbench_with_history(
         history_json,
         turns: display_turns,
         reply,
+        pending_medication_change,
     }
     .render()?)
 }
@@ -2223,7 +2499,7 @@ fn render_assistant_workbench_with_history(
 #[derive(Template)]
 #[template(path = "_latest_weight_header.html")]
 struct LatestWeightHeaderTemplate {
-    latest_weight: Option<WeightEntry>,
+    header_weight_kg: Option<f64>,
 }
 
 #[derive(Template)]
@@ -2250,6 +2526,7 @@ struct TabTimelineTemplate {
 struct TabPlanTemplate {
     pet: Pet,
     prescriptions: Vec<MedicationPrescription>,
+    active_prescriptions: Vec<MedicationPrescription>,
     adherence: Vec<MedicationAdherence>,
     medications: Vec<MedicationAdministration>,
     weights: Vec<WeightEntry>,

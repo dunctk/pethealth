@@ -187,6 +187,22 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_prescriptions_tenant_pet_status
             ON medication_prescriptions(household_id, pet_id, status, created_at DESC);
+        CREATE TABLE IF NOT EXISTS medication_plan_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            prescription_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id),
+            FOREIGN KEY (prescription_id) REFERENCES medication_prescriptions(id),
+            FOREIGN KEY (event_id) REFERENCES health_events(id),
+            UNIQUE (household_id, token_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_confirmations_tenant_pet
+            ON medication_plan_confirmations(household_id, pet_id, created_at DESC);
         CREATE TABLE IF NOT EXISTS medication_adherence (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             household_id INTEGER NOT NULL,
@@ -1056,6 +1072,35 @@ pub async fn create_pet(
         &now,
     )
     .await?;
+    if let Some(weight_kg) = weight_kg {
+        let weight_row = transaction
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO weight_entries(household_id,pet_id,weight_kg,measured_at,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+                [
+                    household_id.into(),
+                    id.into(),
+                    weight_kg.into(),
+                    now.clone().into(),
+                    "Initial weight".into(),
+                    now.clone().into(),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| anyhow!("initial weight insert returned no id"))?;
+        let weight_id: i64 = weight_row.try_get("", "id")?;
+        audit(
+            &transaction,
+            household_id,
+            actor,
+            "weight.created",
+            "weight_entry",
+            weight_id,
+            &format!("{weight_kg:.2} kg"),
+            &now,
+        )
+        .await?;
+    }
     transaction.commit().await?;
     Ok(id)
 }
@@ -1286,6 +1331,234 @@ pub async fn create_medication_prescription(
     Ok(id)
 }
 
+#[derive(Clone, Debug)]
+pub struct MedicationPlanConfirmation {
+    pub replaced_prescriptions: u64,
+    pub already_applied: bool,
+}
+
+/// Applies a human-confirmed medication regimen change atomically. Matching
+/// active prescriptions are retained as stopped history, the new regimen is
+/// created as active, and a timeline event preserves the owner's wording.
+/// The household-scoped token makes a double-click or request replay idempotent.
+#[allow(clippy::too_many_arguments)]
+pub async fn confirm_medication_plan_change(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    confirmation_token_hash: &str,
+    medication_name: &str,
+    dose_value: f64,
+    dose_unit: &str,
+    frequency: &str,
+    reason: Option<&str>,
+    raw_input: &str,
+) -> anyhow::Result<MedicationPlanConfirmation> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let today = now.date_naive().to_string();
+    let transaction = db.begin().await?;
+
+    let pet_exists = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id FROM pets WHERE household_id=? AND id=?",
+            [household_id.into(), pet.id.into()],
+        ))
+        .await?
+        .is_some();
+    if !pet_exists {
+        return Err(anyhow!("pet is outside the household scope"));
+    }
+
+    if let Some(existing) = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT pet_id FROM medication_plan_confirmations
+               WHERE household_id=? AND token_hash=?"#,
+            [household_id.into(), confirmation_token_hash.into()],
+        ))
+        .await?
+    {
+        let confirmed_pet_id: i64 = existing.try_get("", "pet_id")?;
+        if confirmed_pet_id != pet.id {
+            return Err(anyhow!("confirmation token belongs to another pet"));
+        }
+        transaction.commit().await?;
+        return Ok(MedicationPlanConfirmation {
+            replaced_prescriptions: 0,
+            already_applied: true,
+        });
+    }
+
+    let matching = transaction
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT id,active_ingredient,concentration_value,concentration_unit,route
+               FROM medication_prescriptions
+               WHERE household_id=? AND pet_id=? AND status='active' AND name=? COLLATE NOCASE
+               ORDER BY created_at DESC"#,
+            [household_id.into(), pet.id.into(), medication_name.into()],
+        ))
+        .await?;
+    let carried_active_ingredient = matching
+        .first()
+        .map(|row| row.try_get::<Option<String>>("", "active_ingredient"))
+        .transpose()?
+        .flatten();
+    let carried_concentration_value = matching
+        .first()
+        .map(|row| row.try_get::<Option<f64>>("", "concentration_value"))
+        .transpose()?
+        .flatten();
+    let carried_concentration_unit = matching
+        .first()
+        .map(|row| row.try_get::<Option<String>>("", "concentration_unit"))
+        .transpose()?
+        .flatten();
+    let carried_route = matching
+        .first()
+        .map(|row| row.try_get::<Option<String>>("", "route"))
+        .transpose()?
+        .flatten();
+    let matching_ids = matching
+        .iter()
+        .map(|row| row.try_get::<i64>("", "id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let replaced = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"UPDATE medication_prescriptions
+               SET status='stopped',ended_on=?,updated_at=?
+               WHERE household_id=? AND pet_id=? AND status='active' AND name=? COLLATE NOCASE"#,
+            [
+                today.clone().into(),
+                now_text.clone().into(),
+                household_id.into(),
+                pet.id.into(),
+                medication_name.into(),
+            ],
+        ))
+        .await?
+        .rows_affected();
+    for id in matching_ids {
+        audit(
+            &transaction,
+            household_id,
+            actor,
+            "medication.prescription.stopped",
+            "medication_prescription",
+            id,
+            "Replaced by a confirmed medication-plan change",
+            &now_text,
+        )
+        .await?;
+    }
+
+    let prescription_row = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO medication_prescriptions
+               (household_id,pet_id,name,active_ingredient,concentration_value,concentration_unit,dose_value,dose_unit,frequency,route,instructions,started_on,status,raw_input,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                medication_name.into(),
+                carried_active_ingredient.into(),
+                carried_concentration_value.into(),
+                carried_concentration_unit.into(),
+                dose_value.into(),
+                dose_unit.into(),
+                frequency.into(),
+                carried_route.into(),
+                Option::<String>::None.into(),
+                today.into(),
+                "active".into(),
+                raw_input.into(),
+                now_text.clone().into(),
+                now_text.clone().into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow!("confirmed prescription insert returned no id"))?;
+    let prescription_id: i64 = prescription_row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "medication.prescription.created",
+        "medication_prescription",
+        prescription_id,
+        raw_input,
+        &now_text,
+    )
+    .await?;
+
+    let summary = format!("{medication_name}: {dose_value} {dose_unit} {frequency}");
+    let details = reason
+        .map(|value| format!("Confirmed medication plan change. Reason/context: {value}"))
+        .unwrap_or_else(|| "Confirmed medication plan change.".to_owned());
+    let event_row = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO health_events
+               (household_id,pet_id,event_type,concept,summary,raw_input,details,occurred_at,recorded_at,temporal_precision,source)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                "medication".into(),
+                "medication_plan_change".into(),
+                summary.into(),
+                raw_input.into(),
+                details.into(),
+                now_text.clone().into(),
+                now_text.clone().into(),
+                "confirmed_now".into(),
+                "owner_agent_confirmed".into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow!("confirmed medication event insert returned no id"))?;
+    let event_id: i64 = event_row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "event.created",
+        "health_event",
+        event_id,
+        raw_input,
+        &now_text,
+    )
+    .await?;
+
+    transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO medication_plan_confirmations
+               (household_id,pet_id,token_hash,prescription_id,event_id,created_at)
+               VALUES(?,?,?,?,?,?)"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                confirmation_token_hash.into(),
+                prescription_id.into(),
+                event_id.into(),
+                now_text.into(),
+            ],
+        ))
+        .await?;
+    transaction.commit().await?;
+    Ok(MedicationPlanConfirmation {
+        replaced_prescriptions: replaced,
+        already_applied: false,
+    })
+}
+
 pub async fn create_medication_adherence(
     db: &DatabaseConnection,
     household_id: i64,
@@ -1468,6 +1741,48 @@ pub async fn undo_event(
             "health_event",
             event_id,
             "Undo from timeline",
+            &now,
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Changes only the short, human-facing label shown for an event. The original
+/// wording and all structured fields remain untouched so correcting an AI label
+/// never rewrites the underlying health record.
+pub async fn update_event_summary(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+    actor: &str,
+    event_id: i64,
+    summary: &str,
+) -> anyhow::Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let result = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE health_events SET summary=? WHERE household_id=? AND pet_id=? AND id=? AND status='active'",
+            [
+                summary.into(),
+                household_id.into(),
+                pet_id.into(),
+                event_id.into(),
+            ],
+        ))
+        .await?;
+    if result.rows_affected() == 1 {
+        audit(
+            &transaction,
+            household_id,
+            actor,
+            "event.summary.updated",
+            "health_event",
+            event_id,
+            "Timeline label manually edited",
             &now,
         )
         .await?;
@@ -2155,6 +2470,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pet_initial_weight_is_also_a_timeline_weight_record() {
+        let db = test_db().await;
+        let pet_id = create_pet(
+            &db,
+            1,
+            "user:1",
+            "Velcro",
+            "Cat",
+            Some("Domestic Shorthair"),
+            Some(3.2),
+        )
+        .await
+        .unwrap();
+
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        assert_eq!(pet.weight_kg, Some(3.2));
+        let weights = list_weights(&db, 1, pet_id).await.unwrap();
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].weight_kg, 3.2);
+        assert_eq!(weights[0].note.as_deref(), Some("Initial weight"));
+    }
+
+    #[tokio::test]
+    async fn manually_edits_only_the_tenant_scoped_event_label() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Velcro", "Cat", None, None)
+            .await
+            .unwrap();
+        let other_pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        let raw_input = "Velcro vomited after breakfast";
+        let event_id = create_health_event(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            &ProposedEvent {
+                pet_name: "Velcro".into(),
+                event_type: "symptom".into(),
+                concept: "vomiting".into(),
+                summary: "Vomited".into(),
+                details: Some("After breakfast".into()),
+                minutes_ago: None,
+            },
+            raw_input,
+            Utc::now(),
+            "owner_agent",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !update_event_summary(&db, 99, pet_id, "user:99", event_id, "Wrong household")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !update_event_summary(&db, 1, other_pet_id, "user:1", event_id, "Wrong pet")
+                .await
+                .unwrap()
+        );
+        assert!(
+            update_event_summary(
+                &db,
+                1,
+                pet_id,
+                "user:1",
+                event_id,
+                "Vomited after breakfast",
+            )
+            .await
+            .unwrap()
+        );
+
+        let event = get_event(&db, 1, pet_id, event_id).await.unwrap().unwrap();
+        assert_eq!(event.summary, "Vomited after breakfast");
+        assert_eq!(event.raw_input, raw_input);
+        assert_eq!(event.event_type, "symptom");
+        assert_eq!(event.concept, "vomiting");
+        assert_eq!(event.details.as_deref(), Some("After breakfast"));
+
+        let audit = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT action FROM audit_events WHERE household_id=? AND record_type='health_event' AND record_id=? AND action='event.summary.updated'",
+                [1.into(), event_id.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(audit.is_some());
+    }
+
+    #[tokio::test]
     async fn clinical_timeline_keeps_symptom_facts_and_links_recent_medication() {
         let db = test_db().await;
         let pet_id = create_pet(&db, 1, "user:1", "Milo", "Cat", None, None)
@@ -2283,6 +2693,121 @@ mod tests {
                 .unwrap()
                 .prescriptions
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_medication_change_is_scoped_audited_and_idempotent() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Velcro", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        create_medication_prescription(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Apelka",
+            Some("thiamazole"),
+            Some(5.0),
+            Some("mg/mL"),
+            Some(0.5),
+            Some("mL"),
+            Some("twice daily"),
+            Some("by mouth"),
+            None,
+            Some("2026-01-01"),
+            "active",
+            Some("Previous Apelka plan"),
+        )
+        .await
+        .unwrap();
+        let raw = "deciding to change to just give 0.25ml Apelka 1x per day because she has been throwing up before";
+        let first = confirm_medication_plan_change(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "hashed-confirmation-token",
+            "Apelka",
+            0.25,
+            "mL",
+            "once daily",
+            Some("she has been throwing up before"),
+            raw,
+        )
+        .await
+        .unwrap();
+        assert!(!first.already_applied);
+        assert_eq!(first.replaced_prescriptions, 1);
+
+        let prescriptions = list_prescriptions(&db, 1, pet_id, 20).await.unwrap();
+        assert_eq!(prescriptions.len(), 2);
+        assert_eq!(prescriptions[0].status, "active");
+        assert_eq!(prescriptions[0].dose_value, Some(0.25));
+        assert_eq!(prescriptions[0].frequency.as_deref(), Some("once daily"));
+        assert_eq!(
+            prescriptions[0].active_ingredient.as_deref(),
+            Some("thiamazole")
+        );
+        assert_eq!(prescriptions[0].concentration_value, Some(5.0));
+        assert_eq!(prescriptions[1].status, "stopped");
+        assert!(prescriptions[1].ended_on.is_some());
+
+        let events = list_events(&db, 1, Some(pet_id), 20).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].concept, "medication_plan_change");
+        assert_eq!(events[0].raw_input, raw);
+        assert!(
+            events[0]
+                .details
+                .as_deref()
+                .unwrap()
+                .contains("throwing up")
+        );
+
+        let replay = confirm_medication_plan_change(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "hashed-confirmation-token",
+            "Apelka",
+            0.25,
+            "mL",
+            "once daily",
+            Some("she has been throwing up before"),
+            raw,
+        )
+        .await
+        .unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(
+            list_prescriptions(&db, 1, pet_id, 20).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            list_events(&db, 1, Some(pet_id), 20).await.unwrap().len(),
+            1
+        );
+
+        assert!(
+            confirm_medication_plan_change(
+                &db,
+                2,
+                "user:2",
+                &pet,
+                "another-token",
+                "Apelka",
+                1.0,
+                "mL",
+                "daily",
+                None,
+                "out of scope",
+            )
+            .await
+            .is_err()
         );
     }
 

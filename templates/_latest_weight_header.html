@@ -1,1 +1,1 @@
-<span id="header-latest-weight">{% match latest_weight %}{% when Some with (weight) %}{{ weight.weight_kg }} kg{% when None %}Weight not recorded{% endmatch %}</span>
+<span id="header-latest-weight">{% match header_weight_kg %}{% when Some with (weight_kg) %}{{ weight_kg }} kg{% when None %}Weight not recorded{% endmatch %}</span>

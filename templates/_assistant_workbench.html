@@ -38,4 +38,43 @@
     {% if !reply.suggested_prompts.is_empty() %}<div class="assistant-suggestions"><span class="assistant-label">NEXT</span>{% for prompt in reply.suggested_prompts %}<button type="button" data-assistant-example="{{ prompt }}" data-assistant-example-mode="ask">{{ prompt }}</button>{% endfor %}</div>{% endif %}
   </article>
   {% when None %}{% endmatch %}
+
+  {% match pending_medication_change %}
+  {% when Some with (pending) %}
+  <article class="medication-change-review" data-medication-change-review aria-labelledby="medication-change-title" aria-live="polite">
+    <div class="medication-change-head">
+      <span class="medication-change-mark" aria-hidden="true">?</span>
+      <div><span class="side-label">REVIEW BEFORE SAVING</span><h3 id="medication-change-title">Confirm medication-plan change</h3></div>
+      <span class="medication-change-status">PROPOSED</span>
+    </div>
+    <p class="medication-change-intro">I interpreted this as a change to {{ pet.name }}’s ongoing medication plan. Check or edit every field before confirming.</p>
+    <form method="post" action="/agent/medication-plan/confirm" hx-post="/agent/medication-plan/confirm" hx-swap="none" class="medication-change-form" data-assistant-form>
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
+      <input type="hidden" name="view" value="{{ view_key }}">
+      <textarea name="history" hidden>{{ history_json }}</textarea>
+      <input type="hidden" name="confirmation_token" value="{{ pending.confirmation_token }}">
+      <input type="hidden" name="raw_input" value="{{ pending.raw_input }}">
+      <label>Medication<input required maxlength="120" name="medication_name" value="{{ pending.change.medication_name }}"></label>
+      <label>Dose<input required type="number" min="0.001" max="100000" step="0.001" name="dose_value" value="{{ pending.change.dose_value }}"></label>
+      <label>Unit<input required maxlength="30" name="dose_unit" value="{{ pending.change.dose_unit }}"></label>
+      <label>Frequency<input required maxlength="80" name="frequency" value="{{ pending.change.frequency }}"></label>
+      <label class="full-width">Reason / context <span>not recorded as a current symptom</span><textarea maxlength="500" name="reason" rows="2">{% match pending.change.reason %}{% when Some with (reason) %}{{ reason }}{% when None %}{% endmatch %}</textarea></label>
+      <div class="medication-change-impact full-width">
+        <span class="assistant-label">WHAT CONFIRMING WILL DO</span>
+        <ul>
+          <li>Create this as {{ pet.name }}’s active medication regimen.</li>
+          {% if pending.replaces_existing %}<li>Mark the previous active {{ pending.change.medication_name }} regimen as stopped, while retaining it in history.</li>{% else %}<li>No matching active {{ pending.change.medication_name }} regimen was found to replace.</li>{% endif %}
+          <li>Add a medication-plan-change entry to the timeline and preserve your original wording.</li>
+          <li>Keep the vomiting wording as context; it will not create a current vomiting event.</li>
+        </ul>
+      </div>
+      <p class="medication-change-boundary full-width">This records what you decided; it does not verify that the change is medically appropriate.</p>
+      <div class="medication-change-actions full-width">
+        <button class="button primary" type="submit">Confirm plan change</button>
+        <button class="button secondary" type="button" data-cancel-medication-change>Cancel</button>
+        <span class="assistant-processing" role="status">Updating the plan…</span>
+      </div>
+    </form>
+  </article>
+  {% when None %}{% endmatch %}
 </section>

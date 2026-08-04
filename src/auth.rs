@@ -37,9 +37,17 @@ pub async fn verify_password(password: String, encoded: String) -> bool {
 }
 
 pub fn new_session_token() -> String {
+    random_token(64)
+}
+
+pub fn new_action_token() -> String {
+    random_token(48)
+}
+
+fn random_token(length: usize) -> String {
     rand::rng()
         .sample_iter(&Alphanumeric)
-        .take(64)
+        .take(length)
         .map(char::from)
         .collect()
 }

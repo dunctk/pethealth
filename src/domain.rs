@@ -298,6 +298,7 @@ pub fn event_presentation(event_type: &str, concept: &str) -> (&'static str, &'s
     match (event_type, concept) {
         ("symptom", "vomiting") => ("↗", "warning"),
         ("symptom", _) => ("!", "warning"),
+        ("observation", "behavioral_observation") => ("✓", "active"),
         ("medication", _) => ("+", "info"),
         ("measurement", _) => ("≈", "active"),
         ("vet_visit", _) => ("✚", "info"),

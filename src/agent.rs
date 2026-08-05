@@ -210,6 +210,18 @@ impl CaptureAgent {
                 used_model: false,
             });
         }
+        // Positive behavioural recovery notes are common care observations,
+        // not symptoms. Keep this high-confidence path deterministic so a
+        // model outage cannot turn "fully herself" into an unsupported error
+        // or a warning event.
+        if let Some(event) = positive_behavioral_event(input, &resolved_pet) {
+            return Ok(CaptureIntent {
+                event,
+                medication_plan_change: None,
+                missed_medication: false,
+                used_model: false,
+            });
+        }
 
         if self.llm.is_some() {
             match self
@@ -279,7 +291,7 @@ impl CaptureAgent {
                 CaptureError::Model
             })?;
         let prompt = format!(
-            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. If the input contains a medication name with a dose and frequency, classify the primary event as a medication plan change; any symptom after because, due to, or since is reason/context and must not replace the medication event. \
+            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. If the input contains a medication name with a dose and frequency, classify the primary event as a medication plan change; any symptom after because, due to, or since is reason/context and must not replace the medication event. Positive wellbeing notes such as back to herself, good appetite, and alert or lucid behaviour are observation events with concept behavioral_observation, not symptoms. \
              event_type must be one of observation, symptom, medication, measurement, vet_visit. \
              concept is a short lowercase canonical phrase. Preserve factual medication absence and appetite wording in details. Do not invent a medicine, dose, diagnosis, or timestamp. minutes_ago is only for explicit relative time. Input: {}",
             pet_names.join(", "),
@@ -326,6 +338,72 @@ impl CaptureAgent {
     ) -> DateTime<Utc> {
         received_at - Duration::minutes(proposal.minutes_ago.unwrap_or(0).clamp(0, 525_600))
     }
+}
+
+fn positive_behavioral_event(input: &str, pet_name: &str) -> Option<ProposedEvent> {
+    let lower = input.to_lowercase();
+    let normal_self = contains_any(
+        &lower,
+        &[
+            "fully herself",
+            "fully himself",
+            "fully themselves",
+            "back to herself",
+            "back to himself",
+            "back to themselves",
+            "being herself",
+            "being himself",
+            "being themselves",
+            "her usual self",
+            "his usual self",
+            "their usual self",
+            "normal behaviour",
+            "normal behavior",
+        ],
+    );
+    let good_appetite = contains_any(
+        &lower,
+        &[
+            "good appetite",
+            "good apetite",
+            "eating well",
+            "eaten well",
+            "ate well",
+        ],
+    );
+    let alert = contains_any(
+        &lower,
+        &["alert", "lucid", "bright and responsive", "bright-eyed"],
+    );
+    if [normal_self, good_appetite, alert]
+        .into_iter()
+        .filter(|signal| *signal)
+        .count()
+        < 2
+    {
+        return None;
+    }
+
+    let summary = match (normal_self, good_appetite, alert) {
+        (true, true, true) => "Fully herself; good appetite and alert",
+        (true, true, false) => "Back to herself with a good appetite",
+        (true, false, true) => "Back to herself and alert",
+        (false, true, true) => "Good appetite and alert",
+        _ => unreachable!("at least two positive signals are required"),
+    };
+    let details = if lower.contains("first morning") {
+        "Reported as the first morning back to normal, with good appetite and alert/lucid behaviour."
+    } else {
+        "Positive behavioural and wellbeing observation."
+    };
+    Some(ProposedEvent {
+        pet_name: pet_name.to_owned(),
+        event_type: "observation".into(),
+        concept: "behavioral_observation".into(),
+        summary: summary.into(),
+        details: Some(details.into()),
+        minutes_ago: None,
+    })
 }
 
 fn mentions_known_pet(input: &str, pet_names: &[String]) -> bool {
@@ -632,6 +710,36 @@ mod tests {
             change.reason.as_deref(),
             Some("she has been throwing up before")
         );
+    }
+
+    #[tokio::test]
+    async fn records_positive_behavioral_recovery_without_a_model() {
+        let agent = CaptureAgent { llm: None };
+        let result = agent
+            .propose_capture(
+                "Gee feels this is the first morning where Velcro is being fully herself, with good apetite and alert lucid behaviour",
+                &["Velcro".into()],
+                Some("Velcro"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.event.pet_name, "Velcro");
+        assert_eq!(result.event.event_type, "observation");
+        assert_eq!(result.event.concept, "behavioral_observation");
+        assert_eq!(
+            result.event.summary,
+            "Fully herself; good appetite and alert"
+        );
+        assert!(
+            result
+                .event
+                .details
+                .as_deref()
+                .unwrap()
+                .contains("first morning")
+        );
+        assert!(!result.used_model);
+        assert!(!result.missed_medication);
     }
 
     #[tokio::test]

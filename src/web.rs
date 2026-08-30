@@ -4,8 +4,8 @@ use crate::{
     auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
-        MedicationPlanChange, MedicationPrescription, Pet, ShareGrant, TimelineEntry, UserAccount,
-        WeightEntry,
+        MedicationPlanChange, MedicationPlanStop, MedicationPrescription, Pet, ShareGrant,
+        TimelineEntry, UserAccount, WeightEntry,
     },
     ocr,
 };
@@ -46,6 +46,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/agent/medication-plan/confirm",
             post(confirm_agent_medication_plan),
+        )
+        .route(
+            "/agent/medication-plan/stop/confirm",
+            post(confirm_agent_medication_plan_stop),
         )
         .route("/events/{id}/undo", post(undo_event))
         .route("/events/{id}/summary", post(update_event_summary))
@@ -551,7 +555,8 @@ async fn index(
             .iter()
             .filter(|item| item.status == "active")
             .count();
-        assistant_html = render_assistant_workbench(pet, view, "record", Vec::new(), None, None)?;
+        assistant_html =
+            render_assistant_workbench(pet, view, "record", Vec::new(), None, None, None)?;
         tab_html = render_tab_from_data(&state, user.household_id, pet, view, data).await?;
     }
     render(&ConsoleTemplate {
@@ -1147,12 +1152,32 @@ struct ConfirmMedicationPlanForm {
     raw_input: String,
 }
 
+#[derive(Deserialize)]
+struct ConfirmMedicationStopForm {
+    pet_id: i64,
+    view: Option<String>,
+    history: Option<String>,
+    confirmation_token: String,
+    medication_name: String,
+    replacement: String,
+    occurred_on: String,
+    raw_input: String,
+}
+
 #[derive(Clone, Debug)]
 struct PendingMedicationChange {
     change: MedicationPlanChange,
     raw_input: String,
     confirmation_token: String,
     replaces_existing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMedicationStop {
+    stop: MedicationPlanStop,
+    raw_input: String,
+    confirmation_token: String,
+    matches_existing: bool,
 }
 
 async fn capture(
@@ -1300,6 +1325,138 @@ async fn confirm_agent_medication_plan(
         stored_history,
         Some(reply),
         None,
+        None,
+    )?;
+    let timeline = render_agent_timeline(&state, user.household_id, Some(pet.clone())).await?;
+    let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
+        .await?
+        .len();
+    let data = load_console_data(&state, user.household_id, pet.id).await?;
+    let active_prescription_count = data
+        .prescriptions
+        .iter()
+        .filter(|item| item.status == "active")
+        .count();
+    let tab_refresh = if view.is_plan() {
+        let tab_html = render_tab_from_data(&state, user.household_id, &pet, view, data).await?;
+        Some(as_refresh_template(
+            "tab-refresh",
+            format!(r#"<div id="tab-body" class="tab-body">{tab_html}</div>"#),
+        ))
+    } else {
+        None
+    };
+    let mut extra_html = ActivePrescriptionsMetricTemplate {
+        pet: pet.clone(),
+        active_prescription_count,
+    }
+    .render()
+    .map(|html| as_refresh_template("active-prescriptions-refresh", html))?;
+    if let Some(tab_refresh) = tab_refresh {
+        extra_html.push_str(&tab_refresh);
+    }
+    assistant_fragment_response(
+        &headers,
+        assistant_html,
+        Some(timeline.render()?),
+        Some(events_count),
+        Some(extra_html),
+    )
+}
+
+async fn confirm_agent_medication_plan_stop(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
+    Form(form): Form<ConfirmMedicationStopForm>,
+) -> Result<Response, AppError> {
+    let view = ConsoleView::parse(form.view.as_deref());
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let medication_name = clean_required(&form.medication_name, 120, "Medication")?;
+    let replacement = clean_required(&form.replacement, 200, "Replacement/context")?;
+    let raw_input = clean_required(&form.raw_input, 1000, "Original wording")?;
+    let occurred_on = NaiveDate::parse_from_str(
+        clean_required(&form.occurred_on, 10, "Change date")?,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| AppError::validation("Enter a valid change date."))?;
+    if occurred_on > Utc::now().date_naive() {
+        return Err(AppError::validation(
+            "The change date cannot be in the future.",
+        ));
+    }
+    let confirmation_token = clean_required(&form.confirmation_token, 128, "Confirmation")?;
+    if confirmation_token.len() < 32
+        || !confirmation_token
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric())
+    {
+        return Err(AppError::validation(
+            "That confirmation has expired. Try the note again.",
+        ));
+    }
+
+    let result = db::confirm_medication_plan_stop(
+        &state.db,
+        user.household_id,
+        &user.audit_actor(),
+        &pet,
+        &auth::token_hash(confirmation_token),
+        medication_name,
+        replacement,
+        occurred_on,
+        raw_input,
+    )
+    .await?;
+    let answer = if result.already_applied {
+        format!("Already confirmed: {medication_name} was stopped. No duplicate was created.")
+    } else if result.stopped_prescriptions > 0 {
+        format!(
+            "Confirmed: {medication_name} was stopped on {occurred_on}; switched to {replacement}."
+        )
+    } else {
+        format!(
+            "Recorded: {medication_name} was stopped on {occurred_on}; switched to {replacement}. No matching active prescription was found to close."
+        )
+    };
+    let reply = AssistantReply {
+        kind: "answer".into(),
+        title: "MEDICATION STOP CONFIRMED".into(),
+        answer: answer.clone(),
+        evidence: vec![
+            AssistantEvidence {
+                label: "Owner-stated date".into(),
+                detail: occurred_on.to_string(),
+                href: Some(format!("/app?pet={}&view=timeline", pet.id)),
+            },
+            AssistantEvidence {
+                label: "Original wording".into(),
+                detail: "saved with the timeline event".into(),
+                href: Some(format!("/app?pet={}&view=timeline", pet.id)),
+            },
+        ],
+        suggested_prompts: vec![
+            "Show the current medication plan".into(),
+            "Summarize the recent history".into(),
+        ],
+    };
+    let display_turns = parse_assistant_history(form.history.as_deref());
+    let mut stored_history = display_turns.clone();
+    stored_history.push(AssistantTurn {
+        role: "assistant".into(),
+        content: answer,
+    });
+    let assistant_html = render_assistant_workbench_with_history(
+        &pet,
+        view,
+        "record",
+        display_turns,
+        stored_history,
+        Some(reply),
+        None,
+        None,
     )?;
     let timeline = render_agent_timeline(&state, user.household_id, Some(pet.clone())).await?;
     let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
@@ -1352,9 +1509,23 @@ async fn record_agent_event(
     let names: Vec<_> = pets.iter().map(|pet| pet.name.clone()).collect();
     let selected_pet = selected_from(state, user.household_id, &pets, selected_pet_id).await?;
     let selected_pet_name = selected_pet.as_ref().map(|pet| pet.name.as_str());
+    let active_medication_names = match selected_pet.as_ref() {
+        Some(pet) => db::list_prescriptions(&state.db, user.household_id, pet.id, 100)
+            .await?
+            .into_iter()
+            .filter(|prescription| prescription.status == "active")
+            .map(|prescription| prescription.name)
+            .collect(),
+        None => Vec::new(),
+    };
     let intent = match state
         .agent
-        .propose_capture(&message, &names, selected_pet_name)
+        .propose_capture_with_medications(
+            &message,
+            &names,
+            selected_pet_name,
+            &active_medication_names,
+        )
         .await
     {
         Ok(value) => value,
@@ -1373,6 +1544,47 @@ async fn record_agent_event(
     let pet = db::find_pet_by_name(&state.db, user.household_id, &intent.event.pet_name)
         .await?
         .ok_or_else(|| AppError::validation("That pet no longer exists."))?;
+    if let Some(mut stop) = intent.medication_plan_stop {
+        let prescriptions =
+            db::list_prescriptions(&state.db, user.household_id, pet.id, 100).await?;
+        if let Some(matched_name) = closest_active_medication_name(
+            &stop.medication_name,
+            prescriptions
+                .iter()
+                .filter(|prescription| prescription.status == "active")
+                .map(|prescription| prescription.name.as_str()),
+        ) {
+            stop.medication_name = matched_name;
+        }
+        let matches_existing = prescriptions.iter().any(|prescription| {
+            prescription.status == "active"
+                && prescription
+                    .name
+                    .eq_ignore_ascii_case(&stop.medication_name)
+        });
+        let mut history = parse_assistant_history(raw_history);
+        history.push(AssistantTurn {
+            role: "user".into(),
+            content: message.clone(),
+        });
+        let pending = PendingMedicationStop {
+            stop,
+            raw_input: message,
+            confirmation_token: auth::new_action_token(),
+            matches_existing,
+        };
+        let assistant_html = render_assistant_workbench_with_history(
+            &pet,
+            view,
+            "record",
+            history.clone(),
+            history,
+            None,
+            None,
+            Some(pending),
+        )?;
+        return assistant_fragment_response(&headers, assistant_html, None, None, None);
+    }
     if let Some(change) = intent.medication_plan_change {
         let prescriptions =
             db::list_prescriptions(&state.db, user.household_id, pet.id, 100).await?;
@@ -1401,6 +1613,7 @@ async fn record_agent_event(
             history,
             None,
             Some(pending),
+            None,
         )?;
         return assistant_fragment_response(&headers, assistant_html, None, None, None);
     }
@@ -1497,6 +1710,7 @@ async fn record_agent_event(
         history,
         Some(reply),
         None,
+        None,
     )?;
     let timeline = render_agent_timeline(state, user.household_id, Some(pet.clone())).await?;
     let events_count = db::list_events(&state.db, user.household_id, Some(pet.id), 50)
@@ -1572,6 +1786,7 @@ async fn answer_agent_chat(
         stored_history,
         Some(reply),
         None,
+        None,
     )?;
     assistant_fragment_response(headers, assistant_html, None, None, None)
 }
@@ -1603,6 +1818,7 @@ fn assistant_error_response(
         history.clone(),
         history,
         Some(reply),
+        None,
         None,
     )?;
     let response = as_refresh_template("assistant-refresh", html);
@@ -2233,6 +2449,58 @@ where
     }
 }
 
+fn closest_active_medication_name<'a>(
+    supplied: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let supplied = supplied.trim().to_lowercase();
+    let mut best: Option<(usize, String)> = None;
+    let mut tied = false;
+    for candidate in candidates {
+        let normalized = candidate.to_lowercase();
+        if normalized == supplied {
+            return Some(candidate.to_owned());
+        }
+        if supplied.chars().count() < 5 {
+            continue;
+        }
+        let distance = edit_distance(&supplied, &normalized);
+        if distance > 2 {
+            continue;
+        }
+        match &best {
+            None => {
+                best = Some((distance, candidate.to_owned()));
+                tied = false;
+            }
+            Some((best_distance, _)) if distance < *best_distance => {
+                best = Some((distance, candidate.to_owned()));
+                tied = false;
+            }
+            Some((best_distance, _)) if distance == *best_distance => tied = true,
+            Some(_) => {}
+        }
+    }
+    (!tied).then(|| best.map(|(_, name)| name)).flatten()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            current.push(
+                (current[right_index] + 1)
+                    .min(previous[right_index + 1] + 1)
+                    .min(previous[right_index] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 fn clean_required<'a>(value: &'a str, max: usize, label: &str) -> Result<&'a str, AppError> {
     let value = value.trim();
     if value.is_empty() {
@@ -2436,6 +2704,7 @@ struct AssistantWorkbenchTemplate {
     turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
     pending_medication_change: Option<PendingMedicationChange>,
+    pending_medication_stop: Option<PendingMedicationStop>,
 }
 
 #[derive(Template)]
@@ -2458,6 +2727,7 @@ fn render_assistant_workbench(
     turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
     pending_medication_change: Option<PendingMedicationChange>,
+    pending_medication_stop: Option<PendingMedicationStop>,
 ) -> Result<String, AppError> {
     let history_json = serde_json::to_string(&turns)?;
     Ok(AssistantWorkbenchTemplate {
@@ -2469,6 +2739,7 @@ fn render_assistant_workbench(
         turns,
         reply,
         pending_medication_change,
+        pending_medication_stop,
     }
     .render()?)
 }
@@ -2481,6 +2752,7 @@ fn render_assistant_workbench_with_history(
     history_turns: Vec<AssistantTurn>,
     reply: Option<AssistantReply>,
     pending_medication_change: Option<PendingMedicationChange>,
+    pending_medication_stop: Option<PendingMedicationStop>,
 ) -> Result<String, AppError> {
     let history_json = serde_json::to_string(&history_turns)?;
     Ok(AssistantWorkbenchTemplate {
@@ -2492,6 +2764,7 @@ fn render_assistant_workbench_with_history(
         turns: display_turns,
         reply,
         pending_medication_change,
+        pending_medication_stop,
     }
     .render()?)
 }
@@ -2735,5 +3008,17 @@ mod tests {
             HeaderValue::from_static("https://attacker.example"),
         );
         assert!(!same_origin(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn uniquely_reconciles_a_close_medication_typo() {
+        assert_eq!(
+            closest_active_medication_name("alpeka", ["Apelka", "Felimazole"].into_iter()),
+            Some("Apelka".into())
+        );
+        assert_eq!(
+            closest_active_medication_name("abc", ["abd"].into_iter()),
+            None
+        );
     }
 }

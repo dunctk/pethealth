@@ -77,4 +77,40 @@
     </form>
   </article>
   {% when None %}{% endmatch %}
+
+  {% match pending_medication_stop %}
+  {% when Some with (pending) %}
+  <article class="medication-change-review" data-medication-change-review aria-labelledby="medication-stop-title" aria-live="polite">
+    <div class="medication-change-head">
+      <span class="medication-change-mark" aria-hidden="true">?</span>
+      <div><span class="side-label">REVIEW BEFORE SAVING</span><h3 id="medication-stop-title">Confirm medication stop</h3></div>
+      <span class="medication-change-status">PROPOSED</span>
+    </div>
+    <p class="medication-change-intro">I interpreted this as stopping a medication and switching to non-drug care. Check every field before confirming.</p>
+    <form method="post" action="/agent/medication-plan/stop/confirm" hx-post="/agent/medication-plan/stop/confirm" hx-swap="none" class="medication-change-form" data-assistant-form>
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
+      <input type="hidden" name="view" value="{{ view_key }}">
+      <textarea name="history" hidden>{{ history_json }}</textarea>
+      <input type="hidden" name="confirmation_token" value="{{ pending.confirmation_token }}">
+      <input type="hidden" name="raw_input" value="{{ pending.raw_input }}">
+      <label>Medication stopped<input required maxlength="120" name="medication_name" value="{{ pending.stop.medication_name }}"></label>
+      <label>Change date<input required type="date" name="occurred_on" value="{{ pending.stop.occurred_on }}"></label>
+      <label class="full-width">Replacement / context<input required maxlength="200" name="replacement" value="{{ pending.stop.replacement }}"></label>
+      <div class="medication-change-impact full-width">
+        <span class="assistant-label">WHAT CONFIRMING WILL DO</span>
+        <ul>
+          {% if pending.matches_existing %}<li>Mark the active {{ pending.stop.medication_name }} regimen as stopped on {{ pending.stop.occurred_on }}, while retaining it in history.</li>{% else %}<li>No matching active {{ pending.stop.medication_name }} regimen was found; the timeline change will still be recorded.</li>{% endif %}
+          <li>Add a dated medication-stop entry and preserve your original wording.</li>
+          <li>Keep {{ pending.stop.replacement }} as context; it will not be created as a prescription.</li>
+        </ul>
+      </div>
+      <p class="medication-change-boundary full-width">This records what you decided; it does not verify that the change is medically appropriate.</p>
+      <div class="medication-change-actions full-width">
+        <button class="button primary" type="submit">Confirm medication stop</button>
+        <button class="button secondary" type="button" data-cancel-medication-change>Cancel</button>
+        <span class="assistant-processing" role="status">Updating the plan…</span>
+      </div>
+    </form>
+  </article>
+  {% when None %}{% endmatch %}
 </section>

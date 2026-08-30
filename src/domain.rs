@@ -115,6 +115,40 @@ pub struct MedicationPlanChange {
     pub reason: Option<String>,
 }
 
+/// A proposal to stop an active medication in favour of non-medication care.
+/// The owner's stated day is parsed deterministically by the server and still
+/// requires confirmation before the prescription or timeline is changed.
+#[derive(Clone, Debug, Serialize)]
+pub struct MedicationPlanStop {
+    pub pet_name: String,
+    pub medication_name: String,
+    pub replacement: String,
+    pub occurred_on: NaiveDate,
+}
+
+impl MedicationPlanStop {
+    pub fn summary(&self) -> String {
+        format!(
+            "Stopped {}; switched to {}",
+            self.medication_name, self.replacement
+        )
+    }
+
+    pub fn as_event(&self) -> ProposedEvent {
+        ProposedEvent {
+            pet_name: self.pet_name.clone(),
+            event_type: "medication".into(),
+            concept: "medication_plan_stop".into(),
+            summary: self.summary(),
+            details: Some(format!(
+                "Medication stopped; replacement/context: {}.",
+                self.replacement
+            )),
+            minutes_ago: None,
+        }
+    }
+}
+
 impl MedicationPlanChange {
     pub fn summary(&self) -> String {
         format!(

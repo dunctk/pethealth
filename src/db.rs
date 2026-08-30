@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rand::{Rng, distr::Alphanumeric};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, QueryResult,
@@ -203,6 +203,20 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_plan_confirmations_tenant_pet
             ON medication_plan_confirmations(household_id, pet_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS medication_stop_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            event_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id),
+            FOREIGN KEY (event_id) REFERENCES health_events(id),
+            UNIQUE (household_id, token_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stop_confirmations_tenant_pet
+            ON medication_stop_confirmations(household_id, pet_id, created_at DESC);
         CREATE TABLE IF NOT EXISTS medication_adherence (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             household_id INTEGER NOT NULL,
@@ -1559,6 +1573,172 @@ pub async fn confirm_medication_plan_change(
     })
 }
 
+#[derive(Clone, Debug)]
+pub struct MedicationStopConfirmation {
+    pub stopped_prescriptions: u64,
+    pub already_applied: bool,
+}
+
+/// Applies a human-confirmed medication stop atomically. No replacement
+/// prescription is created: non-drug care remains context on the timeline.
+/// The owner-supplied day is stored with day precision, while `recorded_at`
+/// and all audit timestamps remain server-owned.
+#[allow(clippy::too_many_arguments)]
+pub async fn confirm_medication_plan_stop(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet: &Pet,
+    confirmation_token_hash: &str,
+    medication_name: &str,
+    replacement: &str,
+    occurred_on: NaiveDate,
+    raw_input: &str,
+) -> anyhow::Result<MedicationStopConfirmation> {
+    let now = Utc::now();
+    if occurred_on > now.date_naive() {
+        return Err(anyhow!("medication stop date cannot be in the future"));
+    }
+    let now_text = now.to_rfc3339();
+    let occurred_at = occurred_on
+        .and_hms_opt(12, 0, 0)
+        .ok_or_else(|| anyhow!("invalid medication stop date"))?
+        .and_utc()
+        .to_rfc3339();
+    let ended_on = occurred_on.to_string();
+    let transaction = db.begin().await?;
+
+    let pet_exists = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id FROM pets WHERE household_id=? AND id=?",
+            [household_id.into(), pet.id.into()],
+        ))
+        .await?
+        .is_some();
+    if !pet_exists {
+        return Err(anyhow!("pet is outside the household scope"));
+    }
+
+    if let Some(existing) = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT pet_id FROM medication_stop_confirmations
+               WHERE household_id=? AND token_hash=?"#,
+            [household_id.into(), confirmation_token_hash.into()],
+        ))
+        .await?
+    {
+        let confirmed_pet_id: i64 = existing.try_get("", "pet_id")?;
+        if confirmed_pet_id != pet.id {
+            return Err(anyhow!("confirmation token belongs to another pet"));
+        }
+        transaction.commit().await?;
+        return Ok(MedicationStopConfirmation {
+            stopped_prescriptions: 0,
+            already_applied: true,
+        });
+    }
+
+    let matching_ids = transaction
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"SELECT id FROM medication_prescriptions
+               WHERE household_id=? AND pet_id=? AND status='active' AND name=? COLLATE NOCASE"#,
+            [household_id.into(), pet.id.into(), medication_name.into()],
+        ))
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<i64>("", "id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let stopped = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"UPDATE medication_prescriptions
+               SET status='stopped',ended_on=?,updated_at=?
+               WHERE household_id=? AND pet_id=? AND status='active' AND name=? COLLATE NOCASE"#,
+            [
+                ended_on.clone().into(),
+                now_text.clone().into(),
+                household_id.into(),
+                pet.id.into(),
+                medication_name.into(),
+            ],
+        ))
+        .await?
+        .rows_affected();
+    for id in matching_ids {
+        audit(
+            &transaction,
+            household_id,
+            actor,
+            "medication.prescription.stopped",
+            "medication_prescription",
+            id,
+            raw_input,
+            &now_text,
+        )
+        .await?;
+    }
+
+    let summary = format!("Stopped {medication_name}; switched to {replacement}");
+    let details = format!("Confirmed medication stop. Replacement/context: {replacement}.");
+    let event_row = transaction
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO health_events
+               (household_id,pet_id,event_type,concept,summary,raw_input,details,occurred_at,recorded_at,temporal_precision,source)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                "medication".into(),
+                "medication_plan_stop".into(),
+                summary.into(),
+                raw_input.into(),
+                details.into(),
+                occurred_at.into(),
+                now_text.clone().into(),
+                "day".into(),
+                "owner_agent_confirmed".into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow!("confirmed medication stop event insert returned no id"))?;
+    let event_id: i64 = event_row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "event.created",
+        "health_event",
+        event_id,
+        raw_input,
+        &now_text,
+    )
+    .await?;
+    transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"INSERT INTO medication_stop_confirmations
+               (household_id,pet_id,token_hash,event_id,created_at)
+               VALUES(?,?,?,?,?)"#,
+            [
+                household_id.into(),
+                pet.id.into(),
+                confirmation_token_hash.into(),
+                event_id.into(),
+                now_text.into(),
+            ],
+        ))
+        .await?;
+    transaction.commit().await?;
+    Ok(MedicationStopConfirmation {
+        stopped_prescriptions: stopped,
+        already_applied: false,
+    })
+}
+
 pub async fn create_medication_adherence(
     db: &DatabaseConnection,
     household_id: i64,
@@ -2804,6 +2984,95 @@ mod tests {
                 "mL",
                 "daily",
                 None,
+                "out of scope",
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_medication_stop_is_dated_scoped_and_idempotent() {
+        let db = test_db().await;
+        let pet_id = create_pet(&db, 1, "user:1", "Velcro", "Cat", None, None)
+            .await
+            .unwrap();
+        let pet = get_pet(&db, 1, pet_id).await.unwrap().unwrap();
+        create_medication_prescription(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "Apelka",
+            Some("thiamazole"),
+            Some(5.0),
+            Some("mg/mL"),
+            Some(0.25),
+            Some("mL"),
+            Some("once daily"),
+            Some("by mouth"),
+            None,
+            Some("2026-01-01"),
+            "active",
+            Some("Previous Apelka plan"),
+        )
+        .await
+        .unwrap();
+        let raw = "we switched from alpeka to just thyroid food on 6th august";
+        let occurred_on = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let first = confirm_medication_plan_stop(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "hashed-stop-token",
+            "Apelka",
+            "thyroid food",
+            occurred_on,
+            raw,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.stopped_prescriptions, 1);
+        assert!(!first.already_applied);
+
+        let prescriptions = list_prescriptions(&db, 1, pet_id, 20).await.unwrap();
+        assert_eq!(prescriptions[0].status, "stopped");
+        assert_eq!(prescriptions[0].ended_on.as_deref(), Some("2026-08-06"));
+        let events = list_events(&db, 1, Some(pet_id), 20).await.unwrap();
+        assert_eq!(events[0].concept, "medication_plan_stop");
+        assert_eq!(events[0].occurred_at.date_naive(), occurred_on);
+        assert_eq!(events[0].raw_input, raw);
+
+        let replay = confirm_medication_plan_stop(
+            &db,
+            1,
+            "user:1",
+            &pet,
+            "hashed-stop-token",
+            "Apelka",
+            "thyroid food",
+            occurred_on,
+            raw,
+        )
+        .await
+        .unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(
+            list_events(&db, 1, Some(pet_id), 20).await.unwrap().len(),
+            1
+        );
+
+        assert!(
+            confirm_medication_plan_stop(
+                &db,
+                2,
+                "user:2",
+                &pet,
+                "another-stop-token",
+                "Apelka",
+                "thyroid food",
+                occurred_on,
                 "out of scope",
             )
             .await

@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
-    domain::{MedicationPlanChange, ProposedEvent},
+    domain::{MedicationPlanChange, MedicationPlanStop, ProposedEvent},
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use regex::Regex;
 use rig_core::providers::openai;
 use schemars::JsonSchema;
@@ -18,6 +18,7 @@ pub struct CaptureAgent {
 pub struct CaptureIntent {
     pub event: ProposedEvent,
     pub medication_plan_change: Option<MedicationPlanChange>,
+    pub medication_plan_stop: Option<MedicationPlanStop>,
     pub missed_medication: bool,
     pub used_model: bool,
 }
@@ -57,6 +58,37 @@ struct ModelChatReply {
     answer: String,
     #[serde(default)]
     suggested_prompts: Vec<String>,
+}
+
+/// The model is allowed to propose meaning, never an identity, timestamp, or
+/// database operation. The server supplies the pet and derives any date from
+/// the owner's original words before a human confirms a medication change.
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct ModelCaptureIntent {
+    /// `event`, `medication_change`, or `medication_stop`.
+    kind: String,
+    #[serde(default)]
+    event_type: Option<String>,
+    #[serde(default)]
+    concept: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    details: Option<String>,
+    #[serde(default)]
+    minutes_ago: Option<i64>,
+    #[serde(default)]
+    medication_name: Option<String>,
+    #[serde(default)]
+    dose_value: Option<f64>,
+    #[serde(default)]
+    dose_unit: Option<String>,
+    #[serde(default)]
+    frequency: Option<String>,
+    #[serde(default)]
+    replacement: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn default_chat_kind() -> String {
@@ -150,6 +182,10 @@ pub enum CaptureError {
         "I found a possible medication-plan change, but I need the medication, dose, and frequency before I can prepare it for confirmation."
     )]
     MedicationPlanNeedsDetails,
+    #[error(
+        "I found a possible medication stop, but I need the medication, replacement/context, and the day it changed before I can prepare it for confirmation."
+    )]
+    MedicationStopNeedsDetails,
     #[error("The language model did not answer in time. Nothing was saved — try again.")]
     ModelTimeout,
 }
@@ -195,17 +231,55 @@ impl CaptureAgent {
         pet_names: &[String],
         selected_pet: Option<&str>,
     ) -> Result<CaptureIntent, CaptureError> {
+        self.propose_capture_with_medications(input, pet_names, selected_pet, &[])
+            .await
+    }
+
+    pub async fn propose_capture_with_medications(
+        &self,
+        input: &str,
+        pet_names: &[String],
+        selected_pet: Option<&str>,
+        active_medication_names: &[String],
+    ) -> Result<CaptureIntent, CaptureError> {
         // Resolve the pet before calling the model. This keeps the model from
         // inventing a household member and gives pronouns a server-owned scope
         // when the user is already inside a pet's record.
         let resolved_pet = resolve_pet(input, pet_names, selected_pet)?;
+        if self.llm.is_some() {
+            match self
+                .propose_with_model(input, &resolved_pet, active_medication_names)
+                .await
+            {
+                Ok(mut intent) => {
+                    intent.missed_medication = mentions_missed_medication(&input.to_lowercase())
+                        && mentions_reasonable_appetite(&input.to_lowercase());
+                    intent.used_model = true;
+                    return Ok(intent);
+                }
+                Err(error @ (CaptureError::Model | CaptureError::ModelTimeout)) => {
+                    tracing::warn!(%error, "capture model unavailable; using deterministic fallback");
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // Medication-plan changes are consequential and must never pass through
         // the ordinary event-write path. A complete, high-confidence parse is
         // staged for human review before any database write happens.
+        if let Some(stop) = medication_plan_stop(input, &resolved_pet, Utc::now().date_naive()) {
+            return Ok(CaptureIntent {
+                event: stop.as_event(),
+                medication_plan_change: None,
+                medication_plan_stop: Some(stop),
+                missed_medication: false,
+                used_model: false,
+            });
+        }
         if let Some(change) = medication_plan_change(input, &resolved_pet) {
             return Ok(CaptureIntent {
                 event: change.as_event(),
                 medication_plan_change: Some(change),
+                medication_plan_stop: None,
                 missed_medication: false,
                 used_model: false,
             });
@@ -218,49 +292,12 @@ impl CaptureAgent {
             return Ok(CaptureIntent {
                 event,
                 medication_plan_change: None,
+                medication_plan_stop: None,
                 missed_medication: false,
                 used_model: false,
             });
         }
 
-        if self.llm.is_some() {
-            match self
-                .propose_with_model(input, pet_names, selected_pet)
-                .await
-            {
-                Ok(mut intent) => {
-                    // The selected pet is authoritative when the note uses a
-                    // pronoun or an informal reference instead of a known pet
-                    // name. The model still extracts the event semantics.
-                    if !mentions_known_pet(input, pet_names) {
-                        intent.event.pet_name = resolved_pet;
-                    }
-                    if intent.event.concept == "medication_plan_change" {
-                        return Err(CaptureError::MedicationPlanNeedsDetails);
-                    }
-                    // Keep this care workflow reliable even if a model omits
-                    // the boolean in an otherwise valid typed response.
-                    intent.missed_medication = mentions_missed_medication(&input.to_lowercase())
-                        && mentions_reasonable_appetite(&input.to_lowercase());
-                    intent.used_model = true;
-                    return Ok(intent);
-                }
-                Err(error @ (CaptureError::Model | CaptureError::ModelTimeout)) => {
-                    // A short, known phrase can still be recorded safely if
-                    // the provider is unavailable. Unknown prose should keep
-                    // the honest retry/clarification error instead of guessing.
-                    if let Some(mut intent) =
-                        deterministic_proposal(input, pet_names, selected_pet)?
-                    {
-                        intent.used_model = false;
-                        tracing::warn!(%error, "capture model unavailable; using deterministic fallback");
-                        return Ok(intent);
-                    }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
         // No provider configured: retain the offline parser for local installs
         // and make the missing AI configuration visible in the logs.
         if let Some(mut intent) = deterministic_proposal(input, pet_names, selected_pet)? {
@@ -276,8 +313,8 @@ impl CaptureAgent {
     async fn propose_with_model(
         &self,
         input: &str,
-        pet_names: &[String],
-        selected_pet: Option<&str>,
+        pet_name: &str,
+        active_medication_names: &[String],
     ) -> Result<CaptureIntent, CaptureError> {
         let Some(llm) = &self.llm else {
             unreachable!("propose_with_model is only called with a configured model");
@@ -289,19 +326,24 @@ impl CaptureAgent {
             .map_err(|error| {
                 tracing::error!(%error, base_url = %llm.base_url, "could not build the model client");
                 CaptureError::Model
-            })?;
+        })?;
         let prompt = format!(
-            "Extract one factual pet-health event. Known pets: {}. Selected pet context: {}. Use the selected pet when the input uses she, he, or they without a name; otherwise use only a known pet name. If the input contains a medication name with a dose and frequency, classify the primary event as a medication plan change; any symptom after because, due to, or since is reason/context and must not replace the medication event. Positive wellbeing notes such as back to herself, good appetite, and alert or lucid behaviour are observation events with concept behavioral_observation, not symptoms. \
-             event_type must be one of observation, symptom, medication, measurement, vet_visit. \
-             concept is a short lowercase canonical phrase. Preserve factual medication absence and appetite wording in details. Do not invent a medicine, dose, diagnosis, or timestamp. minutes_ago is only for explicit relative time. Input: {}",
-            pet_names.join(", "),
-            selected_pet.unwrap_or("none"),
-            input
+            "You are a pet-health record extraction agent. Return exactly one structured intent for the already-selected pet {pet_name}. Active medication names in this pet's household-scoped record: {}. \
+             Use kind=medication_change only when the owner states a new medication regimen with a medication, positive dose, dose unit, and frequency. Use kind=medication_stop when the owner says a medication was stopped or switched to non-drug care; include the medication name and replacement/context. Never classify food as a medication. \
+             Use kind=event for all other factual observations, with event_type limited to observation, symptom, medication, measurement, or vet_visit; concept must be a short lowercase canonical phrase. \
+             Do not diagnose, prescribe, invent a medication, invent a date, or choose a pet. Do not return a date field: the server derives a date only from explicit words in the owner's original input. minutes_ago is allowed only for an explicit relative duration. \
+             Any symptom after because, due to, or since is context for a medication change, not a separate primary event. Preserve factual medication absence and appetite wording in details. Input: {}",
+            if active_medication_names.is_empty() {
+                "none recorded".to_owned()
+            } else {
+                active_medication_names.join(", ")
+            },
+            input,
         );
         let proposal = tokio::time::timeout(
             llm.timeout,
             client
-                .extractor::<ProposedEvent>(&llm.model)
+                .extractor::<ModelCaptureIntent>(&llm.model)
                 .build()
                 .extract(&prompt),
         )
@@ -321,14 +363,7 @@ impl CaptureAgent {
             tracing::error!(%error, model = %llm.model, "model extraction failed");
             CaptureError::Model
         })?;
-        validate_pet(&proposal.pet_name, pet_names)?;
-        validate_proposal(&proposal)?;
-        Ok(CaptureIntent {
-            event: proposal,
-            medication_plan_change: None,
-            missed_medication: false,
-            used_model: true,
-        })
+        model_intent_to_capture(proposal, input, pet_name, Utc::now().date_naive())
     }
 
     pub fn occurred_at(
@@ -338,6 +373,86 @@ impl CaptureAgent {
     ) -> DateTime<Utc> {
         received_at - Duration::minutes(proposal.minutes_ago.unwrap_or(0).clamp(0, 525_600))
     }
+}
+
+fn model_intent_to_capture(
+    intent: ModelCaptureIntent,
+    input: &str,
+    pet_name: &str,
+    today: NaiveDate,
+) -> Result<CaptureIntent, CaptureError> {
+    match intent.kind.as_str() {
+        "event" => {
+            let event = ProposedEvent {
+                pet_name: pet_name.to_owned(),
+                event_type: required_model_field(intent.event_type)?,
+                concept: required_model_field(intent.concept)?,
+                summary: required_model_field(intent.summary)?,
+                details: intent.details.filter(|value| !value.trim().is_empty()),
+                minutes_ago: intent.minutes_ago,
+            };
+            validate_proposal(&event)?;
+            if event.concept == "medication_plan_change" || event.concept == "medication_plan_stop"
+            {
+                return Err(CaptureError::MedicationPlanNeedsDetails);
+            }
+            Ok(CaptureIntent {
+                event,
+                medication_plan_change: None,
+                medication_plan_stop: None,
+                missed_medication: false,
+                used_model: true,
+            })
+        }
+        "medication_change" => {
+            let medication_name = required_model_field(intent.medication_name)?;
+            let dose_value = intent
+                .dose_value
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or(CaptureError::MedicationPlanNeedsDetails)?;
+            let change = MedicationPlanChange {
+                pet_name: pet_name.to_owned(),
+                medication_name,
+                dose_value,
+                dose_unit: required_model_field(intent.dose_unit)?,
+                frequency: required_model_field(intent.frequency)?,
+                reason: intent.reason.filter(|value| !value.trim().is_empty()),
+            };
+            Ok(CaptureIntent {
+                event: change.as_event(),
+                medication_plan_change: Some(change),
+                medication_plan_stop: None,
+                missed_medication: false,
+                used_model: true,
+            })
+        }
+        "medication_stop" => {
+            let occurred_on = explicit_date_from_input(input, today)
+                .ok_or(CaptureError::MedicationStopNeedsDetails)?;
+            let stop = MedicationPlanStop {
+                pet_name: pet_name.to_owned(),
+                medication_name: required_model_field(intent.medication_name)?,
+                replacement: required_model_field(intent.replacement)?,
+                occurred_on,
+            };
+            Ok(CaptureIntent {
+                event: stop.as_event(),
+                medication_plan_change: None,
+                medication_plan_stop: Some(stop),
+                missed_medication: false,
+                used_model: true,
+            })
+        }
+        _ => Err(CaptureError::Model),
+    }
+}
+
+fn required_model_field(value: Option<String>) -> Result<String, CaptureError> {
+    let value = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= 500)
+        .ok_or(CaptureError::Model)?;
+    Ok(value)
 }
 
 fn positive_behavioral_event(input: &str, pet_name: &str) -> Option<ProposedEvent> {
@@ -406,17 +521,6 @@ fn positive_behavioral_event(input: &str, pet_name: &str) -> Option<ProposedEven
     })
 }
 
-fn mentions_known_pet(input: &str, pet_names: &[String]) -> bool {
-    let lower = input.to_lowercase();
-    pet_names.iter().any(|name| {
-        let escaped = regex::escape(&name.to_lowercase());
-        Regex::new(&format!(
-            r"(?:^|[^\p{{L}}\p{{N}}]){escaped}(?:$|[^\p{{L}}\p{{N}}])"
-        ))
-        .is_ok_and(|regex| regex.is_match(&lower))
-    })
-}
-
 fn validate_proposal(proposal: &ProposedEvent) -> Result<(), CaptureError> {
     if !matches!(
         proposal.event_type.as_str(),
@@ -449,6 +553,7 @@ fn deterministic_proposal(
                 minutes_ago: None,
             },
             medication_plan_change: None,
+            medication_plan_stop: None,
             missed_medication: true,
             used_model: false,
         }));
@@ -484,6 +589,7 @@ fn deterministic_proposal(
             minutes_ago,
         },
         medication_plan_change: None,
+        medication_plan_stop: None,
         missed_medication: false,
         used_model: false,
     }))
@@ -533,6 +639,75 @@ fn medication_plan_change(input: &str, pet_name: &str) -> Option<MedicationPlanC
     })
 }
 
+fn medication_plan_stop(
+    input: &str,
+    pet_name: &str,
+    today: NaiveDate,
+) -> Option<MedicationPlanStop> {
+    let captures = Regex::new(
+        r"(?ix)\b(?:switched|changed)\s+from\s+([[:alpha:]][[:alnum:]_-]*)\s+to\s+(?:just\s+)?(.+?)\s+on\s+(\d{1,2})(?:st|nd|rd|th)?\s+([[:alpha:]]+)\b",
+    )
+    .ok()?
+    .captures(input)?;
+    let medication_name = captures.get(1)?.as_str().to_owned();
+    let replacement = captures
+        .get(2)?
+        .as_str()
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_owned();
+    if replacement.is_empty() {
+        return None;
+    }
+    let occurred_on =
+        explicit_date_from_parts(captures.get(3)?.as_str(), captures.get(4)?.as_str(), today)?;
+    Some(MedicationPlanStop {
+        pet_name: pet_name.to_owned(),
+        medication_name,
+        replacement,
+        occurred_on,
+    })
+}
+
+/// Resolves a month-and-day only when those exact terms appear in the owner's
+/// note. The model never proposes or supplies an authoritative timestamp.
+fn explicit_date_from_input(input: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let captures = Regex::new(r"(?ix)\b(\d{1,2})(?:st|nd|rd|th)?\s+([[:alpha:]]+)\b")
+        .ok()?
+        .captures(input)?;
+    explicit_date_from_parts(captures.get(1)?.as_str(), captures.get(2)?.as_str(), today)
+}
+
+fn explicit_date_from_parts(
+    day_text: &str,
+    month_text: &str,
+    today: NaiveDate,
+) -> Option<NaiveDate> {
+    let day: u32 = day_text.parse().ok()?;
+    let month = match month_text.to_lowercase().as_str() {
+        "jan" | "january" => 1,
+        "feb" | "february" => 2,
+        "mar" | "march" => 3,
+        "apr" | "april" => 4,
+        "may" => 5,
+        "jun" | "june" => 6,
+        "jul" | "july" => 7,
+        "aug" | "august" => 8,
+        "sep" | "sept" | "september" => 9,
+        "oct" | "october" => 10,
+        "nov" | "november" => 11,
+        "dec" | "december" => 12,
+        _ => return None,
+    };
+    let mut year = today.year();
+    let mut occurred_on = NaiveDate::from_ymd_opt(year, month, day)?;
+    if occurred_on > today {
+        year -= 1;
+        occurred_on = NaiveDate::from_ymd_opt(year, month, day)?;
+    }
+    Some(occurred_on)
+}
+
 fn resolve_pet(
     input: &str,
     pet_names: &[String],
@@ -561,17 +736,6 @@ fn resolve_pet(
             .map(str::to_owned)
             .ok_or(CaptureError::PetMissing),
         _ => Err(CaptureError::PetAmbiguous),
-    }
-}
-
-fn validate_pet(name: &str, pet_names: &[String]) -> Result<(), CaptureError> {
-    if pet_names
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(name))
-    {
-        Ok(())
-    } else {
-        Err(CaptureError::PetMissing)
     }
 }
 
@@ -710,6 +874,98 @@ mod tests {
             change.reason.as_deref(),
             Some("she has been throwing up before")
         );
+    }
+
+    #[tokio::test]
+    async fn proposes_dated_medication_stop_for_non_drug_replacement() {
+        let agent = CaptureAgent { llm: None };
+        let result = agent
+            .propose_capture(
+                "we switched from alpeka to just thyroid food on 6th august",
+                &["Velcro".into()],
+                Some("Velcro"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.event.pet_name, "Velcro");
+        assert_eq!(result.event.concept, "medication_plan_stop");
+        let stop = result.medication_plan_stop.unwrap();
+        assert_eq!(stop.medication_name, "alpeka");
+        assert_eq!(stop.replacement, "thyroid food");
+        assert_eq!(stop.occurred_on.month(), 8);
+        assert_eq!(stop.occurred_on.day(), 6);
+        assert!(stop.occurred_on <= Utc::now().date_naive());
+    }
+
+    #[test]
+    fn an_unqualified_future_month_means_the_previous_year() {
+        let stop = medication_plan_stop(
+            "switched from Apelka to thyroid food on 6th august",
+            "Velcro",
+            NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stop.occurred_on,
+            NaiveDate::from_ymd_opt(2025, 8, 6).unwrap()
+        );
+    }
+
+    #[test]
+    fn model_medication_stop_uses_only_the_date_in_owner_words() {
+        let intent = model_intent_to_capture(
+            ModelCaptureIntent {
+                kind: "medication_stop".into(),
+                event_type: None,
+                concept: None,
+                summary: None,
+                details: None,
+                minutes_ago: None,
+                medication_name: Some("Apelka".into()),
+                dose_value: None,
+                dose_unit: None,
+                frequency: None,
+                replacement: Some("thyroid food".into()),
+                reason: None,
+            },
+            "we switched from alpeka to just thyroid food on 6th august",
+            "Velcro",
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        )
+        .unwrap();
+        let used_model = intent.used_model;
+        let stop = intent.medication_plan_stop.unwrap();
+        assert_eq!(stop.medication_name, "Apelka");
+        assert_eq!(
+            stop.occurred_on,
+            NaiveDate::from_ymd_opt(2026, 8, 6).unwrap()
+        );
+        assert!(used_model);
+    }
+
+    #[test]
+    fn model_medication_stop_without_an_owner_stated_date_is_rejected() {
+        let error = model_intent_to_capture(
+            ModelCaptureIntent {
+                kind: "medication_stop".into(),
+                event_type: None,
+                concept: None,
+                summary: None,
+                details: None,
+                minutes_ago: None,
+                medication_name: Some("Apelka".into()),
+                dose_value: None,
+                dose_unit: None,
+                frequency: None,
+                replacement: Some("thyroid food".into()),
+                reason: None,
+            },
+            "we switched from alpeka to just thyroid food",
+            "Velcro",
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CaptureError::MedicationStopNeedsDetails));
     }
 
     #[tokio::test]

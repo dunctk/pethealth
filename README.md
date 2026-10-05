@@ -8,6 +8,14 @@ The first complete workflow is intentionally direct:
 
 The application also creates expiring, revocable, read-only vet links. Share tokens are stored only as SHA-256 hashes and are displayed to the owner once.
 
+## Appearance photos
+
+Each pet has a private **Photos** tab for quick appearance tracking. On a phone, **Take photo** opens the camera and automatically uploads the selected shot. Files are stored beneath `PET_PHOTOS_DIR` in household- and pet-scoped directories and are only served back through authenticated, household-scoped routes.
+
+When `OPENROUTER_API_KEY` or `LLM_API_KEY` is configured, the app asks the configured vision-capable model to locate both eyes in the background. The browser then uses those normalized eye coordinates to rotate, scale, and translate each image onto the same canvas, making it easier to step through changes without the face jumping around between frames. If the eyes cannot be found, the original framing is still shown.
+
+For two-date comparisons, the owner can select any two photos and request a cautious AI visual comparison. The prompt explicitly separates visible changes from pose, distance, expression, fur, and lighting differences and does not ask the model to diagnose a condition or attribute a change to medication. Image inputs are sent as private base64 data rather than public photo URLs.
+
 ## Weights and blood tests
 
 The console keeps a dated weight history for each pet. Blood-test files are stored under a private household directory beneath `BLOOD_TESTS_DIR` (local default: `./example_blood_tests`; production compose default: `/persistent/blood_tests`). The web console can upload a PDF or image directly, and Syncthing can place files in the matching household directory. The owner then chooses **Import new tests**, or calls the MCP `upload_blood_test` / `import_blood_tests` tools.

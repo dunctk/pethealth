@@ -1153,6 +1153,19 @@ async fn upload_photo(
                 }
             }
         });
+    } else {
+        db::update_photo_alignment(
+            &state.db,
+            user.household_id,
+            &actor,
+            photo_id,
+            None,
+            None,
+            None,
+            None,
+            "unavailable",
+        )
+        .await?;
     }
 
     if wants_fragment(&headers) {

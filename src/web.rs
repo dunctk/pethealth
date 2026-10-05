@@ -4,8 +4,8 @@ use crate::{
     auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
-        MedicationPlanChange, MedicationPlanStop, MedicationPrescription, Pet, PetPhoto, ShareGrant,
-        TimelineEntry, UserAccount, WeightEntry,
+        MedicationPlanChange, MedicationPlanStop, MedicationPrescription, Pet, PetPhoto,
+        ShareGrant, TimelineEntry, UserAccount, WeightEntry,
     },
     ocr, photos,
 };
@@ -1026,7 +1026,6 @@ async fn create_adherence(
     Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
 }
 
-
 async fn render_photos_tab(
     state: &AppState,
     household_id: i64,
@@ -1083,15 +1082,10 @@ async fn upload_photo(
         .ok_or_else(AppError::not_found)?;
     let (filename, mime_type, bytes) =
         uploaded_file.ok_or_else(|| AppError::validation("Take or choose a photo."))?;
-    let storage_name = photos::store_upload(
-        &state.config,
-        user.household_id,
-        pet.id,
-        &mime_type,
-        &bytes,
-    )
-    .await
-    .map_err(|error| AppError::validation(error.to_string()))?;
+    let storage_name =
+        photos::store_upload(&state.config, user.household_id, pet.id, &mime_type, &bytes)
+            .await
+            .map_err(|error| AppError::validation(error.to_string()))?;
     let captured_at = Utc::now().to_rfc3339();
     let actor = user.audit_actor();
     let photo_id = match db::create_pet_photo(
@@ -1108,13 +1102,7 @@ async fn upload_photo(
     {
         Ok(id) => id,
         Err(error) => {
-            photos::remove_upload(
-                &state.config,
-                user.household_id,
-                pet.id,
-                &storage_name,
-            )
-            .await;
+            photos::remove_upload(&state.config, user.household_id, pet.id, &storage_name).await;
             return Err(error.into());
         }
     };

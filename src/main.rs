@@ -5,6 +5,7 @@ mod db;
 mod domain;
 mod mcp;
 mod ocr;
+mod photos;
 mod web;
 
 use anyhow::Context;

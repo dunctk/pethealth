@@ -836,3 +836,161 @@ document.addEventListener("htmx:beforeSwap", (event) => {
     event.detail.isError = false;
   }
 });
+
+
+// Appearance-photo capture and eye-aligned stepping.
+function drawPhotoViewer(viewer, index) {
+  const thumbs = Array.from(viewer.querySelectorAll("[data-photo-thumb]"));
+  if (!thumbs.length) return;
+  const bounded = Math.max(0, Math.min(index, thumbs.length - 1));
+  viewer.dataset.photoIndex = String(bounded);
+  const thumb = thumbs[bounded];
+  thumbs.forEach((candidate, i) => candidate.classList.toggle("active", i === bounded));
+
+  const range = viewer.querySelector("[data-photo-range]");
+  if (range) range.value = String(bounded);
+  const date = viewer.querySelector("[data-photo-date]");
+  if (date) date.textContent = thumb.dataset.photoDate || "";
+  const position = viewer.querySelector("[data-photo-index]");
+  if (position) position.textContent = `${bounded + 1} of ${thumbs.length}`;
+
+  const canvas = viewer.querySelector("[data-photo-canvas]");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const alignToggle = viewer.querySelector("[data-photo-align]");
+  const shouldAlign = !alignToggle || alignToggle.checked;
+  const coords = [
+    Number(thumb.dataset.leftEyeX),
+    Number(thumb.dataset.leftEyeY),
+    Number(thumb.dataset.rightEyeX),
+    Number(thumb.dataset.rightEyeY),
+  ];
+  const hasEyes = coords.every(Number.isFinite);
+  const note = viewer.querySelector("[data-photo-alignment-note]");
+  if (note) {
+    if (shouldAlign && hasEyes) {
+      note.textContent = "Eyes aligned automatically";
+    } else if (thumb.dataset.alignmentStatus === "pending") {
+      note.textContent = "Eye alignment processing…";
+    } else if (thumb.dataset.alignmentStatus === "failed") {
+      note.textContent = "Eyes could not be located automatically";
+    } else {
+      note.textContent = shouldAlign ? "Original framing" : "Alignment off";
+    }
+  }
+
+  const image = new Image();
+  image.decoding = "async";
+  image.onload = () => {
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#050707";
+    ctx.fillRect(0, 0, width, height);
+
+    if (shouldAlign && hasEyes) {
+      const [leftX, leftY, rightX, rightY] = coords;
+      const sourceLeftX = leftX * image.naturalWidth;
+      const sourceLeftY = leftY * image.naturalHeight;
+      const sourceRightX = rightX * image.naturalWidth;
+      const sourceRightY = rightY * image.naturalHeight;
+      const sourceDistance = Math.hypot(
+        sourceRightX - sourceLeftX,
+        sourceRightY - sourceLeftY
+      );
+      if (sourceDistance > 1) {
+        const targetLeftX = width * 0.34;
+        const targetRightX = width * 0.66;
+        const targetY = height * 0.40;
+        const scale = (targetRightX - targetLeftX) / sourceDistance;
+        const angle = Math.atan2(
+          sourceRightY - sourceLeftY,
+          sourceRightX - sourceLeftX
+        );
+        ctx.save();
+        ctx.translate(targetLeftX, targetY);
+        ctx.rotate(-angle);
+        ctx.scale(scale, scale);
+        ctx.translate(-sourceLeftX, -sourceLeftY);
+        ctx.drawImage(image, 0, 0);
+        ctx.restore();
+        return;
+      }
+    }
+
+    const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
+    const drawWidth = image.naturalWidth * scale;
+    const drawHeight = image.naturalHeight * scale;
+    ctx.drawImage(
+      image,
+      (width - drawWidth) / 2,
+      (height - drawHeight) / 2,
+      drawWidth,
+      drawHeight
+    );
+  };
+  image.src = thumb.dataset.photoUrl;
+}
+
+function initPhotoViewers(root = document) {
+  root.querySelectorAll("[data-photo-viewer]").forEach((viewer) => {
+    if (viewer.dataset.photoViewerBound === "true") return;
+    viewer.dataset.photoViewerBound = "true";
+    const thumbs = Array.from(viewer.querySelectorAll("[data-photo-thumb]"));
+    if (!thumbs.length) return;
+
+    const redraw = () => drawPhotoViewer(viewer, Number(viewer.dataset.photoIndex || thumbs.length - 1));
+    thumbs.forEach((thumb, index) => {
+      thumb.addEventListener("click", () => drawPhotoViewer(viewer, index));
+    });
+    const range = viewer.querySelector("[data-photo-range]");
+    if (range) range.addEventListener("input", () => drawPhotoViewer(viewer, Number(range.value)));
+    const previous = viewer.querySelector("[data-photo-prev]");
+    if (previous) previous.addEventListener("click", () => drawPhotoViewer(viewer, Number(viewer.dataset.photoIndex || 0) - 1));
+    const next = viewer.querySelector("[data-photo-next]");
+    if (next) next.addEventListener("click", () => drawPhotoViewer(viewer, Number(viewer.dataset.photoIndex || 0) + 1));
+    const align = viewer.querySelector("[data-photo-align]");
+    if (align) align.addEventListener("change", redraw);
+    drawPhotoViewer(viewer, thumbs.length - 1);
+  });
+}
+
+function initPhotoCapture(root = document) {
+  root.querySelectorAll(".photo-capture-input").forEach((input) => {
+    if (input.dataset.captureBound === "true") return;
+    input.dataset.captureBound = "true";
+    input.addEventListener("change", () => {
+      if (input.files && input.files.length) {
+        const form = input.closest("form");
+        if (form) form.requestSubmit();
+      }
+    });
+  });
+}
+
+function refreshPendingPhotoAlignment(root = document) {
+  const tab = root.querySelector("[data-photo-tab]");
+  if (!tab || tab.dataset.photoRefreshScheduled === "true") return;
+  const pending = tab.querySelector('[data-photo-thumb][data-alignment-status="pending"]');
+  const petId = tab.dataset.petId;
+  if (!pending || !petId || !window.htmx) return;
+  tab.dataset.photoRefreshScheduled = "true";
+  window.setTimeout(() => {
+    if (!document.contains(tab)) return;
+    window.htmx.ajax("GET", `/app/tab/photos?pet=${encodeURIComponent(petId)}`, {
+      target: "#tab-body",
+      swap: "innerHTML",
+    });
+  }, 4500);
+}
+
+function initPhotoTracking(root = document) {
+  initPhotoCapture(root);
+  initPhotoViewers(root);
+  refreshPendingPhotoAlignment(root);
+}
+
+document.addEventListener("DOMContentLoaded", () => initPhotoTracking(document));
+document.addEventListener("htmx:afterSwap", (event) => initPhotoTracking(event.target || document));

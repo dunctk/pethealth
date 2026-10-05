@@ -285,6 +285,26 @@ pub async fn migrate(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_weights_tenant_pet_time
             ON weight_entries(household_id, pet_id, measured_at DESC);
+        CREATE TABLE IF NOT EXISTS pet_photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            storage_name TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            left_eye_x REAL,
+            left_eye_y REAL,
+            right_eye_x REAL,
+            right_eye_y REAL,
+            alignment_status TEXT NOT NULL DEFAULT 'pending',
+            FOREIGN KEY (household_id) REFERENCES households(id),
+            FOREIGN KEY (pet_id) REFERENCES pets(id),
+            UNIQUE (household_id, storage_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pet_photos_tenant_pet_time
+            ON pet_photos(household_id, pet_id, captured_at ASC);
         CREATE TABLE IF NOT EXISTS lab_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             household_id INTEGER NOT NULL,
@@ -950,6 +970,118 @@ pub async fn list_weights(
         [household_id.into(), pet_id.into()],
     )).await?;
     rows.into_iter().map(weight_from_row).collect()
+}
+
+pub async fn create_pet_photo(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    pet_id: i64,
+    storage_name: &str,
+    original_filename: &str,
+    mime_type: &str,
+    captured_at: &str,
+) -> anyhow::Result<i64> {
+    let uploaded_at = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let row = transaction.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO pet_photos(household_id,pet_id,storage_name,original_filename,mime_type,captured_at,uploaded_at,alignment_status) VALUES(?,?,?,?,?,?,?,'pending') RETURNING id",
+        [
+            household_id.into(),
+            pet_id.into(),
+            storage_name.into(),
+            original_filename.into(),
+            mime_type.into(),
+            captured_at.into(),
+            uploaded_at.clone().into(),
+        ],
+    )).await?.ok_or_else(|| anyhow!("photo insert returned no id"))?;
+    let id: i64 = row.try_get("", "id")?;
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "photo.created",
+        "pet_photo",
+        id,
+        original_filename,
+        &uploaded_at,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(id)
+}
+
+pub async fn list_pet_photos(
+    db: &DatabaseConnection,
+    household_id: i64,
+    pet_id: i64,
+) -> anyhow::Result<Vec<crate::domain::PetPhoto>> {
+    let rows = db.query_all(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT id,household_id,pet_id,storage_name,original_filename,mime_type,captured_at,uploaded_at,left_eye_x,left_eye_y,right_eye_x,right_eye_y,alignment_status FROM pet_photos WHERE household_id=? AND pet_id=? ORDER BY captured_at ASC LIMIT 365",
+        [household_id.into(), pet_id.into()],
+    )).await?;
+    rows.into_iter().map(photo_from_row).collect()
+}
+
+pub async fn get_pet_photo(
+    db: &DatabaseConnection,
+    household_id: i64,
+    photo_id: i64,
+) -> anyhow::Result<Option<crate::domain::PetPhoto>> {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT id,household_id,pet_id,storage_name,original_filename,mime_type,captured_at,uploaded_at,left_eye_x,left_eye_y,right_eye_x,right_eye_y,alignment_status FROM pet_photos WHERE household_id=? AND id=?",
+        [household_id.into(), photo_id.into()],
+    )).await?.map(photo_from_row).transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_photo_alignment(
+    db: &DatabaseConnection,
+    household_id: i64,
+    actor: &str,
+    photo_id: i64,
+    left_eye_x: Option<f64>,
+    left_eye_y: Option<f64>,
+    right_eye_x: Option<f64>,
+    right_eye_y: Option<f64>,
+    status: &str,
+) -> anyhow::Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
+    let result = transaction.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE pet_photos SET left_eye_x=?,left_eye_y=?,right_eye_x=?,right_eye_y=?,alignment_status=? WHERE household_id=? AND id=?",
+        [
+            left_eye_x.into(),
+            left_eye_y.into(),
+            right_eye_x.into(),
+            right_eye_y.into(),
+            status.into(),
+            household_id.into(),
+            photo_id.into(),
+        ],
+    )).await?;
+    if result.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    audit(
+        &transaction,
+        household_id,
+        actor,
+        "photo.alignment.updated",
+        "pet_photo",
+        photo_id,
+        status,
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
 }
 
 pub async fn report_hash_exists(
@@ -2480,6 +2612,30 @@ fn weight_from_row(row: QueryResult) -> anyhow::Result<crate::domain::WeightEntr
             .parse()
             .context("invalid weight timestamp")?,
         note: row.try_get("", "note")?,
+    })
+}
+
+fn photo_from_row(row: QueryResult) -> anyhow::Result<crate::domain::PetPhoto> {
+    Ok(crate::domain::PetPhoto {
+        id: row.try_get("", "id")?,
+        household_id: row.try_get("", "household_id")?,
+        pet_id: row.try_get("", "pet_id")?,
+        storage_name: row.try_get("", "storage_name")?,
+        original_filename: row.try_get("", "original_filename")?,
+        mime_type: row.try_get("", "mime_type")?,
+        captured_at: row
+            .try_get::<String>("", "captured_at")?
+            .parse()
+            .context("invalid photo capture timestamp")?,
+        uploaded_at: row
+            .try_get::<String>("", "uploaded_at")?
+            .parse()
+            .context("invalid photo upload timestamp")?,
+        left_eye_x: row.try_get("", "left_eye_x")?,
+        left_eye_y: row.try_get("", "left_eye_y")?,
+        right_eye_x: row.try_get("", "right_eye_x")?,
+        right_eye_y: row.try_get("", "right_eye_y")?,
+        alignment_status: row.try_get("", "alignment_status")?,
     })
 }
 

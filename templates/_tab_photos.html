@@ -1,0 +1,124 @@
+<section class="photos-tab" data-photo-tab data-pet-id="{{ pet.id }}">
+  <div class="photo-capture-card">
+    <div>
+      <span class="side-label">APPEARANCE</span>
+      <h2>Track visible changes</h2>
+      <p>Take a quick photo from the same sort of angle when you can. Files are stored privately for this household. When AI is enabled, the photo is also sent to the configured AI provider to locate the eyes.</p>
+    </div>
+    <form class="photo-capture-form"
+          action="/photos/upload"
+          method="post"
+          enctype="multipart/form-data"
+          hx-post="/photos/upload"
+          hx-encoding="multipart/form-data"
+          hx-target="#tab-body"
+          hx-swap="innerHTML">
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
+      <label class="photo-camera-button">
+        <span>Take photo</span>
+        <input class="photo-capture-input"
+               type="file"
+               name="file"
+               accept="image/jpeg,image/png,image/webp"
+               capture="environment"
+               required>
+      </label>
+      <span class="photo-upload-status" aria-live="polite">Uploading…</span>
+    </form>
+  </div>
+
+  {% if photos.len() == 0 %}
+  <div class="photo-empty">
+    <strong>No appearance photos yet.</strong>
+    <span>Your first photo becomes the baseline for future comparisons.</span>
+  </div>
+  {% else %}
+  <div class="photo-viewer" data-photo-viewer>
+    <div class="photo-stage">
+      <canvas width="720" height="720" data-photo-canvas aria-label="Appearance photo viewer"></canvas>
+    </div>
+    <div class="photo-viewer-controls">
+      <button class="button secondary" type="button" data-photo-prev aria-label="Previous photo">←</button>
+      <div>
+        <strong data-photo-date></strong>
+        <small data-photo-index></small>
+      </div>
+      <button class="button secondary" type="button" data-photo-next aria-label="Next photo">→</button>
+    </div>
+    <input class="photo-range"
+           type="range"
+           min="0"
+           max="{{ photos.len() - 1 }}"
+           value="{{ photos.len() - 1 }}"
+           step="1"
+           data-photo-range
+           aria-label="Move through appearance photos">
+    <div class="photo-viewer-options">
+      <label><input type="checkbox" checked data-photo-align> Keep eyes aligned</label>
+      <span data-photo-alignment-note></span>
+    </div>
+
+    <div class="photo-strip" aria-label="Appearance photo history">
+      {% for photo in photos %}
+      <button class="photo-thumb"
+              type="button"
+              data-photo-thumb
+              data-photo-id="{{ photo.id }}"
+              data-photo-url="/photos/{{ photo.id }}/image"
+              data-photo-date="{{ photo.captured_at.format("%d %b %Y · %H:%M") }}"
+              data-alignment-status="{{ photo.alignment_status }}"
+              {% match photo.left_eye_x %}{% when Some with (value) %}data-left-eye-x="{{ value }}"{% when None %}{% endmatch %}
+              {% match photo.left_eye_y %}{% when Some with (value) %}data-left-eye-y="{{ value }}"{% when None %}{% endmatch %}
+              {% match photo.right_eye_x %}{% when Some with (value) %}data-right-eye-x="{{ value }}"{% when None %}{% endmatch %}
+              {% match photo.right_eye_y %}{% when Some with (value) %}data-right-eye-y="{{ value }}"{% when None %}{% endmatch %}
+              aria-label="Show photo from {{ photo.captured_at.format("%d %b %Y at %H:%M") }}">
+        <img src="/photos/{{ photo.id }}/image" loading="lazy" alt="">
+        <span>{{ photo.captured_at.format("%d %b") }}</span>
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if photos.len() > 1 %}
+  <section class="photo-analysis-card">
+    <div class="section-head compact">
+      <div>
+        <span class="side-label">AI COMPARISON</span>
+        <h2>Compare two dates</h2>
+      </div>
+      <span>Visual changes only</span>
+    </div>
+    {% if ai_available %}
+    <form class="photo-compare-form"
+          hx-post="/photos/compare"
+          hx-target="#photo-analysis-result"
+          hx-swap="innerHTML">
+      <input type="hidden" name="pet_id" value="{{ pet.id }}">
+      <label>From
+        <select name="from_id">
+          {% for photo in photos %}
+          <option value="{{ photo.id }}" {% if photo.id == default_from_id %}selected{% endif %}>{{ photo.captured_at.format("%d %b %Y · %H:%M") }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <span class="photo-compare-arrow" aria-hidden="true">→</span>
+      <label>To
+        <select name="to_id">
+          {% for photo in photos %}
+          <option value="{{ photo.id }}" {% if photo.id == default_to_id %}selected{% endif %}>{{ photo.captured_at.format("%d %b %Y · %H:%M") }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="button" type="submit">Analyze change</button>
+      <span class="htmx-indicator">Analyzing…</span>
+    </form>
+    {% else %}
+    <p class="photo-ai-unavailable">Set <code>OPENROUTER_API_KEY</code> to enable eye alignment and visual comparison.</p>
+    {% endif %}
+    <div id="photo-analysis-result"></div>
+  </section>
+  {% endif %}
+  {% endif %}
+
+  <p class="photo-safety-note">Appearance tracking is context for you and your vet, not a diagnosis. Lighting, distance, pose and expression can all change how a face looks.</p>
+</section>

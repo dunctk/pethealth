@@ -18,6 +18,7 @@ pub struct Config {
     pub llm_timeout_seconds: u64,
     pub mistral_api_key: Option<String>,
     pub blood_tests_dir: String,
+    pub pet_photos_dir: String,
 }
 
 impl Config {
@@ -64,6 +65,8 @@ impl Config {
             mistral_api_key: nonempty_env("MISTRAL_API_KEY"),
             blood_tests_dir: env::var("BLOOD_TESTS_DIR")
                 .unwrap_or_else(|_| "./example_blood_tests".to_owned()),
+            pet_photos_dir: env::var("PET_PHOTOS_DIR")
+                .unwrap_or_else(|_| "./data/pet_photos".to_owned()),
         })
     }
 }
@@ -102,6 +105,7 @@ mod tests {
             llm_timeout_seconds: 20,
             mistral_api_key: None,
             blood_tests_dir: "./example_blood_tests".into(),
+            pet_photos_dir: "./data/pet_photos".into(),
         };
         assert!(config.database_url.contains("/persistent/pethealth.sqlite"));
     }

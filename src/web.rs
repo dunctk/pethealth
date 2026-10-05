@@ -4,10 +4,10 @@ use crate::{
     auth, db,
     domain::{
         HealthEvent, KnowledgeArticle, LabReport, MedicationAdherence, MedicationAdministration,
-        MedicationPlanChange, MedicationPlanStop, MedicationPrescription, Pet, ShareGrant,
-        TimelineEntry, UserAccount, WeightEntry,
+        MedicationPlanChange, MedicationPlanStop, MedicationPrescription, Pet, PetPhoto,
+        ShareGrant, TimelineEntry, UserAccount, WeightEntry,
     },
-    ocr,
+    ocr, photos,
 };
 use askama::Template;
 use axum::{
@@ -41,6 +41,9 @@ pub fn router(state: AppState) -> Router {
         .route("/medication-adherence", post(create_adherence))
         .route("/blood-tests/upload", post(upload_blood_test))
         .route("/blood-tests/import", post(import_blood_tests))
+        .route("/photos/upload", post(upload_photo))
+        .route("/photos/{id}/image", get(photo_image))
+        .route("/photos/compare", post(compare_photos))
         .route("/agent/capture", post(capture))
         .route("/agent/chat", post(agent_chat))
         .route(
@@ -292,6 +295,7 @@ enum ConsoleView {
     Timeline,
     Plan,
     Labs,
+    Photos,
     Sharing,
 }
 
@@ -301,6 +305,7 @@ impl ConsoleView {
         match value {
             Some("plan") => Self::Plan,
             Some("labs") => Self::Labs,
+            Some("photos") => Self::Photos,
             Some("sharing") => Self::Sharing,
             _ => Self::Timeline,
         }
@@ -314,6 +319,9 @@ impl ConsoleView {
     fn is_labs(self) -> bool {
         self == Self::Labs
     }
+    fn is_photos(self) -> bool {
+        self == Self::Photos
+    }
     fn is_sharing(self) -> bool {
         self == Self::Sharing
     }
@@ -322,6 +330,7 @@ impl ConsoleView {
             Self::Timeline => "Timeline",
             Self::Plan => "Plan",
             Self::Labs => "Labs",
+            Self::Photos => "Photos",
             Self::Sharing => "Sharing",
         }
     }
@@ -330,6 +339,7 @@ impl ConsoleView {
             Self::Timeline => "timeline",
             Self::Plan => "plan",
             Self::Labs => "labs",
+            Self::Photos => "photos",
             Self::Sharing => "sharing",
         }
     }
@@ -513,6 +523,7 @@ async fn render_tab_from_data(
             }
             .render()?
         }
+        ConsoleView::Photos => render_photos_tab(state, household_id, pet).await?,
         ConsoleView::Sharing => TabSharingTemplate {
             pet: pet.clone(),
             shares: data.shares,
@@ -1013,6 +1024,230 @@ async fn create_adherence(
     )
     .await?;
     Ok(Redirect::to(&format!("/app?pet={}", pet.id)))
+}
+
+async fn render_photos_tab(
+    state: &AppState,
+    household_id: i64,
+    pet: &Pet,
+) -> Result<String, AppError> {
+    let photos = db::list_pet_photos(&state.db, household_id, pet.id).await?;
+    let default_from_id = photos.first().map(|photo| photo.id).unwrap_or_default();
+    let default_to_id = photos.last().map(|photo| photo.id).unwrap_or_default();
+    Ok(TabPhotosTemplate {
+        pet: pet.clone(),
+        photos,
+        ai_available: state.config.llm_api_key.is_some(),
+        default_from_id,
+        default_to_id,
+    }
+    .render()?)
+}
+
+async fn upload_photo(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    let mut pet_id = None;
+    let mut uploaded_file: Option<(String, String, Vec<u8>)> = None;
+    while let Some(field) = multipart.next_field().await? {
+        match field.name() {
+            Some("pet_id") => {
+                pet_id = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i64>().ok());
+            }
+            Some("file") => {
+                let filename = field
+                    .file_name()
+                    .ok_or_else(|| AppError::validation("Take or choose a photo."))?
+                    .to_owned();
+                let mime_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                let bytes = field.bytes().await?.to_vec();
+                uploaded_file = Some((filename, mime_type, bytes));
+            }
+            _ => {}
+        }
+    }
+    let pet_id = pet_id.ok_or_else(|| AppError::validation("Choose a pet first."))?;
+    let pet = db::get_pet(&state.db, user.household_id, pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let (filename, mime_type, bytes) =
+        uploaded_file.ok_or_else(|| AppError::validation("Take or choose a photo."))?;
+    let storage_name =
+        photos::store_upload(&state.config, user.household_id, pet.id, &mime_type, &bytes)
+            .await
+            .map_err(|error| AppError::validation(error.to_string()))?;
+    let captured_at = Utc::now().to_rfc3339();
+    let actor = user.audit_actor();
+    let photo_id = match db::create_pet_photo(
+        &state.db,
+        user.household_id,
+        &actor,
+        pet.id,
+        &storage_name,
+        &filename,
+        &mime_type,
+        &captured_at,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            photos::remove_upload(&state.config, user.household_id, pet.id, &storage_name).await;
+            return Err(error.into());
+        }
+    };
+
+    if state.config.llm_api_key.is_some() {
+        let config = state.config.clone();
+        let database = state.db.clone();
+        let bytes = bytes.clone();
+        let mime_type = mime_type.clone();
+        let actor = actor.clone();
+        let household_id = user.household_id;
+        tokio::spawn(async move {
+            match photos::detect_eyes(&config, &mime_type, &bytes).await {
+                Ok(alignment) => {
+                    if let Err(error) = db::update_photo_alignment(
+                        &database,
+                        household_id,
+                        &actor,
+                        photo_id,
+                        Some(alignment.left_x),
+                        Some(alignment.left_y),
+                        Some(alignment.right_x),
+                        Some(alignment.right_y),
+                        "ready",
+                    )
+                    .await
+                    {
+                        tracing::warn!(photo_id, %error, "failed to save photo eye alignment");
+                    }
+                }
+                Err(error) => {
+                    tracing::info!(photo_id, %error, "automatic eye alignment unavailable");
+                    if let Err(update_error) = db::update_photo_alignment(
+                        &database,
+                        household_id,
+                        &actor,
+                        photo_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "failed",
+                    )
+                    .await
+                    {
+                        tracing::warn!(photo_id, %update_error, "failed to mark photo alignment");
+                    }
+                }
+            }
+        });
+    } else {
+        db::update_photo_alignment(
+            &state.db,
+            user.household_id,
+            &actor,
+            photo_id,
+            None,
+            None,
+            None,
+            None,
+            "unavailable",
+        )
+        .await?;
+    }
+
+    if wants_fragment(&headers) {
+        return Ok(Html(render_photos_tab(&state, user.household_id, &pet).await?).into_response());
+    }
+    Ok(Redirect::to(&format!("/app?pet={}&view=photos", pet.id)).into_response())
+}
+
+async fn photo_image(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let photo = db::get_pet_photo(&state.db, user.household_id, id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let bytes = photos::load_photo(&state.config, &photo).await?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&photo.mime_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+struct PhotoCompareForm {
+    pet_id: i64,
+    from_id: i64,
+    to_id: i64,
+}
+
+async fn compare_photos(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserAccount>,
+    Form(form): Form<PhotoCompareForm>,
+) -> Result<Html<String>, AppError> {
+    let pet = db::get_pet(&state.db, user.household_id, form.pet_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    if form.from_id == form.to_id {
+        return Err(AppError::validation("Choose two different photos."));
+    }
+    let from_photo = db::get_pet_photo(&state.db, user.household_id, form.from_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let to_photo = db::get_pet_photo(&state.db, user.household_id, form.to_id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    if from_photo.pet_id != pet.id || to_photo.pet_id != pet.id {
+        return Err(AppError::not_found());
+    }
+    let from_bytes = photos::load_photo(&state.config, &from_photo).await?;
+    let to_bytes = photos::load_photo(&state.config, &to_photo).await?;
+    let analysis = match photos::compare_photos(
+        &state.config,
+        &pet.name,
+        &from_photo,
+        &from_bytes,
+        &to_photo,
+        &to_bytes,
+    )
+    .await
+    {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            tracing::warn!(pet_id = pet.id, %error, "photo AI comparison failed");
+            return Err(AppError::validation(
+                "AI comparison failed. Check that the configured model supports image input and try again.",
+            ));
+        }
+    };
+    render(&PhotoAnalysisTemplate {
+        from_photo,
+        to_photo,
+        analysis,
+    })
 }
 
 async fn import_blood_tests(
@@ -2810,6 +3045,24 @@ struct TabPlanTemplate {
 struct TabLabsTemplate {
     pet: Pet,
     lab_reports: Vec<LabReport>,
+}
+
+#[derive(Template)]
+#[template(path = "_tab_photos.html")]
+struct TabPhotosTemplate {
+    pet: Pet,
+    photos: Vec<PetPhoto>,
+    ai_available: bool,
+    default_from_id: i64,
+    default_to_id: i64,
+}
+
+#[derive(Template)]
+#[template(path = "_photo_analysis.html")]
+struct PhotoAnalysisTemplate {
+    from_photo: PetPhoto,
+    to_photo: PetPhoto,
+    analysis: String,
 }
 
 #[derive(Template)]

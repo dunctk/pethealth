@@ -405,6 +405,7 @@ mod tests {
             llm_timeout_seconds: 20,
             mistral_api_key: None,
             blood_tests_dir: root.to_string_lossy().into_owned(),
+            pet_photos_dir: root.join("photos").to_string_lossy().into_owned(),
         }
     }
     #[test]

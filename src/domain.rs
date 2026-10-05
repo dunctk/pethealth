@@ -247,6 +247,23 @@ pub struct WeightEntry {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct PetPhoto {
+    pub id: i64,
+    pub household_id: i64,
+    pub pet_id: i64,
+    pub storage_name: String,
+    pub original_filename: String,
+    pub mime_type: String,
+    pub captured_at: DateTime<Utc>,
+    pub uploaded_at: DateTime<Utc>,
+    pub left_eye_x: Option<f64>,
+    pub left_eye_y: Option<f64>,
+    pub right_eye_x: Option<f64>,
+    pub right_eye_y: Option<f64>,
+    pub alignment_status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct LabReport {
     pub id: i64,
     pub pet_id: i64,

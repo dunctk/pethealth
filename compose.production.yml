@@ -16,6 +16,7 @@ services:
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
       BLOOD_TESTS_DIR: ${BLOOD_TESTS_DIR:-/persistent/blood_tests}
+      PET_PHOTOS_DIR: ${PET_PHOTOS_DIR:-/persistent/pet_photos}
       RUST_LOG: pethealth=info,tower_http=info
     expose:
       - "3000"

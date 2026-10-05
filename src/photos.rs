@@ -74,12 +74,7 @@ pub async fn store_upload(
     Ok(storage_name)
 }
 
-pub async fn remove_upload(
-    config: &Config,
-    household_id: i64,
-    pet_id: i64,
-    storage_name: &str,
-) {
+pub async fn remove_upload(config: &Config, household_id: i64, pet_id: i64, storage_name: &str) {
     let _ = fs::remove_file(photo_path(config, household_id, pet_id, storage_name)).await;
 }
 
@@ -207,7 +202,10 @@ async fn vision_request(
         .await
         .context("vision request failed")?;
     let status = response.status();
-    let body = response.text().await.context("failed to read vision response")?;
+    let body = response
+        .text()
+        .await
+        .context("failed to read vision response")?;
     if !status.is_success() {
         bail!("vision model returned {status}: {}", truncate(&body, 240));
     }
@@ -256,12 +254,7 @@ fn pet_directory(config: &Config, household_id: i64, pet_id: i64) -> PathBuf {
         .join(pet_id.to_string())
 }
 
-fn photo_path(
-    config: &Config,
-    household_id: i64,
-    pet_id: i64,
-    storage_name: &str,
-) -> PathBuf {
+fn photo_path(config: &Config, household_id: i64, pet_id: i64, storage_name: &str) -> PathBuf {
     pet_directory(config, household_id, pet_id).join(storage_name)
 }
 
